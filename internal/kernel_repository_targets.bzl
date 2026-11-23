@@ -1,5 +1,6 @@
 """Private target graph emitted by linux_image."""
 
+load(":architecture_profiles.bzl", "linux_architecture_profile")
 load(":architectures.bzl", "linux_architectures")
 load(":kernel_bundle.bzl", "linux_kernel_bundle", "linux_kernel_exports")
 load(":linux_modules.bzl", "linux_module_sdk")
@@ -67,6 +68,7 @@ def _define_config(
         "UTS_MACHINE": arch.uts_machine,
     })
     compact_vars.update(module_make_vars)
+    profile = linux_architecture_profile(arch.config_name)
     kwargs = {
         "name": name,
         "config": config,
@@ -76,6 +78,9 @@ def _define_config(
             "ARCH": arch.arch,
             "SRCARCH": arch.srcarch,
         },
+        "linux_arch": profile.linux_arch,
+        "target_profile": profile.name,
+        "target_triple": profile.target_triple,
         "root": _source_label(source_repo, "Kconfig"),
         "rust_enabled": rust_enabled,
         "source_root": _source_label(source_repo, "Kconfig"),

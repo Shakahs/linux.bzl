@@ -212,6 +212,22 @@ cc_library(
     includes = ["scripts/include"],
 )
 
+# objtool sources that only some releases have. Linux 7.x always links
+# klp-symid.c, because check.c references it; it runs only for --klp-symids,
+# which only scripts/livepatch/klp-build requests. The livepatch tooling itself
+# (builtin-klp.c, klp-diff.c and the rest) is not built.
+filegroup(
+    name = "objtool_release_srcs",
+    srcs = glob(["tools/objtool/klp-symid.c", "tools/objtool/signal.c"], allow_empty = True),
+)
+
+# Linux 7.x links sorttable with the ELF parser it shares with
+# tracepoint-update; earlier releases have no such sources.
+filegroup(
+    name = "sorttable_elf_parse_srcs",
+    srcs = glob(["scripts/elf-parse.c", "scripts/elf-parse.h"], allow_empty = True),
+)
+
 cc_library(
     name = "genksyms_headers_cc",
     hdrs = ["scripts/genksyms/genksyms.h"],

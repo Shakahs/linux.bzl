@@ -21,6 +21,7 @@ type RustProfile struct {
 	TargetFlags        RustFlagSet             `json:"target_flags"`
 	Module             RustModuleProfile       `json:"module"`
 	Bindgen            RustBindgenProfile      `json:"bindgen"`
+	HostLibraries      []RustHostLibrary       `json:"host_libraries"`
 	ProcMacros         []RustProcMacroProfile  `json:"proc_macros"`
 	Crates             []RustCrateProfile      `json:"crates"`
 	GeneratedAssembly  []RustGeneratedAssembly `json:"generated_assembly,omitempty"`
@@ -83,11 +84,26 @@ type RustBindgenProfile struct {
 	CommonFlags    []string `json:"common_flags"`
 }
 
+// RustHostLibrary is an rlib compiled for the build host and linked into
+// procedural macros, such as Linux 7.x's vendored proc-macro2, quote and syn.
+// Flags are appended to the common Rust flags after SkipFlags are removed.
+type RustHostLibrary struct {
+	Name              string                 `json:"name"`
+	Source            string                 `json:"source"`
+	SourcePrefixes    []string               `json:"source_prefixes"`
+	Deps              []string               `json:"deps"`
+	Flags             []string               `json:"flags"`
+	SkipFlags         []string               `json:"skip_flags"`
+	VersionPredicates []RustVersionPredicate `json:"version_predicates"`
+}
+
+// Deps name the host libraries a procedural macro links.
 type RustProcMacroProfile struct {
 	Name           string   `json:"name"`
 	Source         string   `json:"source"`
 	SourcePrefixes []string `json:"source_prefixes"`
 	SourceFiles    []string `json:"source_files"`
+	Deps           []string `json:"deps"`
 	Flags          []string `json:"flags"`
 	UsesRustcCfg   bool     `json:"uses_rustc_cfg"`
 }
@@ -103,6 +119,7 @@ type RustCrateProfile struct {
 	Flags             []string               `json:"flags"`
 	SkipFlags         []string               `json:"skip_flags"`
 	ObjcopyFlags      []string               `json:"objcopy_flags"`
+	Envs              []string               `json:"envs"`
 	VersionPredicates []RustVersionPredicate `json:"version_predicates"`
 }
 
@@ -214,16 +231,26 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 	layout := "legacy"
 	hasPinInit := rustProfileFileExists(sourceRoot, "rust/pin-init/src/lib.rs")
 	hasPinInitInternal := rustProfileFileExists(sourceRoot, "rust/pin-init/internal/src/lib.rs")
+	hasVendoredSyn := rustProfileFileExists(sourceRoot, "rust/syn/lib.rs")
 	if hasPinInit != hasPinInitInternal {
 		return nil, fmt.Errorf("unrecognized mixed Rust pin-init layout")
 	}
+	if hasVendoredSyn && !hasPinInit {
+		return nil, fmt.Errorf("unrecognized Rust layout: vendored syn without pin-init")
+	}
 	if hasPinInit {
 		layout = "pin-init"
-		for _, path := range []string{
-			"rust/macros/quote.rs",
+		layoutFiles := []string{"rust/macros/quote.rs"}
+		if hasVendoredSyn {
+			// Linux 7.x replaced the hand-written quote.rs with vendored
+			// proc-macro2, quote and syn host crates, and added zerocopy.
+			layout = "vendored-syn"
+			layoutFiles = rustVendoredSynSources
+		}
+		for _, path := range append(layoutFiles,
 			"rust/pin-init/src/lib.rs",
 			"rust/pin-init/internal/src/lib.rs",
-		} {
+		) {
 			if err := requireRustProfileFile(sourceRoot, path); err != nil {
 				return nil, err
 			}
@@ -294,8 +321,15 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 	if err != nil {
 		return nil, err
 	}
-	if layout == "pin-init" && !procMacroUsesRustcCfg {
+	if layout != "legacy" && !procMacroUsesRustcCfg {
 		return nil, fmt.Errorf("pin-init Rust layout requires proc macros to consume rustc_cfg")
+	}
+	var vendored *rustVendoredSynGraph
+	if layout == "vendored-syn" {
+		vendored, err = parseRustVendoredSynGraph(rustMake, buildMake)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	redirects, err := rustRedirectIntrinsics(rustMake, architecture)
@@ -389,7 +423,9 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 		Flags:          []string{},
 		UsesRustcCfg:   procMacroUsesRustcCfg,
 	}}
-	if layout == "pin-init" {
+	var hostLibraries []RustHostLibrary
+	switch layout {
+	case "pin-init":
 		procMacros = append(procMacros, RustProcMacroProfile{
 			Name:           "pin_init_internal",
 			Source:         "rust/pin-init/internal/src/lib.rs",
@@ -398,9 +434,12 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 			Flags:          []string{"--cfg", "kernel"},
 			UsesRustcCfg:   true,
 		})
+	case "vendored-syn":
+		hostLibraries = vendored.hostLibraries
+		procMacros = vendored.procMacros
 	}
 
-	crates := rustCrateGraph(layout, coreObjcopy, coreEditionAtLeast)
+	crates := rustCrateGraph(layout, coreObjcopy, coreEditionAtLeast, vendored)
 	generatedAssembly, err := rustGeneratedAssembly(sourceRoot, rustMake, layout)
 	if err != nil {
 		return nil, err
@@ -414,8 +453,11 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 	}
 
 	moduleExterns := []string{"kernel"}
-	if layout == "pin-init" {
+	switch layout {
+	case "pin-init":
 		moduleExterns = append([]string{"pin_init"}, moduleExterns...)
+	case "vendored-syn":
+		moduleExterns = vendored.moduleExterns
 	}
 	moduleFlags := []string{
 		"--cfg", "MODULE",
@@ -433,11 +475,20 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 		{Path: "rust/core.o"},
 		{Path: "rust/compiler_builtins.o"},
 		{Path: "rust/ffi.o"},
-		{Path: "rust/helpers/helpers.o"},
-		{Path: "rust/bindings.o"},
 	}
-	if layout == "pin-init" {
+	if layout == "vendored-syn" {
+		runtime = append(runtime, RustRuntimeObject{Path: "rust/zerocopy.o"})
+	}
+	runtime = append(runtime,
+		RustRuntimeObject{Path: "rust/helpers/helpers.o"},
+		RustRuntimeObject{Path: "rust/bindings.o"},
+	)
+	if layout != "legacy" {
 		runtime = append(runtime, RustRuntimeObject{Path: "rust/pin_init.o"})
+	}
+	bindgenRustTarget := "1.68"
+	if layout == "vendored-syn" {
+		bindgenRustTarget = vendored.bindgenRustTarget
 	}
 	runtime = append(runtime,
 		RustRuntimeObject{Path: "rust/kernel.o"},
@@ -469,7 +520,7 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 			UAPIHeader:     "rust/uapi/uapi_helper.h",
 			HelpersSource:  "rust/helpers/helpers.c",
 			CommonFlags: []string{
-				"--rust-target", "1.68",
+				"--rust-target", bindgenRustTarget,
 				"--use-core",
 				"--with-derive-default",
 				"--ctypes-prefix", "ffi",
@@ -478,6 +529,7 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 				"--enable-function-attribute-detection",
 			},
 		},
+		HostLibraries:     hostLibraries,
 		ProcMacros:        procMacros,
 		Crates:            crates,
 		GeneratedAssembly: generatedAssembly,
@@ -492,7 +544,7 @@ func GenerateRustProfile(sourceRoot, arch string) (*RustProfile, error) {
 	return profile, nil
 }
 
-func rustCrateGraph(layout string, coreObjcopy []string, coreEditionAtLeast string) []RustCrateProfile {
+func rustCrateGraph(layout string, coreObjcopy []string, coreEditionAtLeast string, vendored *rustVendoredSynGraph) []RustCrateProfile {
 	empty := []string{}
 	crates := []RustCrateProfile{
 		{
@@ -527,7 +579,14 @@ func rustCrateGraph(layout string, coreObjcopy []string, coreEditionAtLeast stri
 			ObjcopyFlags:    []string{"-w", "-W", "__*"},
 		},
 	}
-	if layout == "pin-init" {
+	if vendored != nil {
+		crates = append(crates, vendored.zerocopy)
+	}
+	if layout != "legacy" {
+		pinInitFlags := []string{"--cfg", "kernel"}
+		if vendored != nil {
+			pinInitFlags = vendored.pinInitFlags
+		}
 		crates = append(crates, RustCrateProfile{
 			Name:            "pin_init",
 			Source:          "rust/pin-init/src/lib.rs",
@@ -536,7 +595,7 @@ func rustCrateGraph(layout string, coreObjcopy []string, coreEditionAtLeast stri
 			GeneratedInputs: empty,
 			Deps:            []string{"core", "compiler_builtins", "macros", "pin_init_internal"},
 			Externs:         []string{"pin_init_internal", "macros"},
-			Flags:           []string{"--cfg", "kernel"},
+			Flags:           pinInitFlags,
 			SkipFlags:       empty,
 			ObjcopyFlags:    empty,
 		})
@@ -544,7 +603,7 @@ func rustCrateGraph(layout string, coreObjcopy []string, coreEditionAtLeast stri
 	baseDeps := []string{"core", "compiler_builtins"}
 	pinDeps := []string{}
 	pinExterns := []string{}
-	if layout == "pin-init" {
+	if layout != "legacy" {
 		pinDeps = []string{"pin_init", "macros", "pin_init_internal"}
 		pinExterns = []string{"pin_init"}
 	}
@@ -576,13 +635,17 @@ func rustCrateGraph(layout string, coreObjcopy []string, coreEditionAtLeast stri
 	)
 	kernelDeps := append([]string{}, baseDeps...)
 	kernelDeps = append(kernelDeps, "ffi", "build_error")
-	if layout == "pin-init" {
+	if layout != "legacy" {
 		kernelDeps = append(kernelDeps, "pin_init", "bindings", "uapi", "macros", "pin_init_internal")
 	} else {
 		kernelDeps = append(kernelDeps, "bindings", "uapi", "macros")
 	}
 	kernelExterns := append([]string{"ffi"}, pinExterns...)
 	kernelExterns = append(kernelExterns, "build_error", "macros", "bindings", "uapi")
+	if vendored != nil {
+		kernelDeps = append(kernelDeps, "zerocopy", "zerocopy_derive")
+		kernelExterns = append(kernelExterns, "zerocopy", "zerocopy_derive")
+	}
 	crates = append(crates, RustCrateProfile{
 		Name: "kernel", Source: "rust/kernel/lib.rs", SourcePrefixes: []string{"rust/kernel/"},
 		SourceFiles: empty, GeneratedInputs: empty,
@@ -590,6 +653,278 @@ func rustCrateGraph(layout string, coreObjcopy []string, coreEditionAtLeast stri
 		Flags: empty, SkipFlags: empty, ObjcopyFlags: empty,
 	})
 	return crates
+}
+
+// rustVendoredSynSources are the crate roots Linux 7.x vendors for its
+// procedural macros and for zerocopy.
+var rustVendoredSynSources = []string{
+	"rust/proc-macro2/lib.rs",
+	"rust/quote/lib.rs",
+	"rust/syn/lib.rs",
+	"rust/zerocopy/src/lib.rs",
+	"rust/zerocopy-derive/lib.rs",
+}
+
+var (
+	rustMinVersionWords = regexp.MustCompile(`\$\(if[ \t]+\$\(call[ \t]+rustc-min-version,[ \t]*([0-9]+)\),([^$()]*)\)`)
+	rustExternFlag      = regexp.MustCompile(`--extern[ \t]+([A-Za-z0-9_]+)`)
+	rustMacrosFlags     = regexp.MustCompile(`(?m)^\$\(obj\)/\$\(libmacros_name\):[ \t]*private[ \t]+rustc_target_flags[ \t]*=[ \t]*\\\n[ \t]*([^\\\n]*)$`)
+	rustBindgenTarget   = regexp.MustCompile(`\$\(BINDGEN\)[ \t]+\$<[ \t]+\$\(bindgen_target_flags\)[ \t]+--rust-target[ \t]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)`)
+	rustCrateEnv        = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*=[^ \t]*$`)
+)
+
+// rustVendoredSynGraph is the part of the Linux 7.x crate graph that differs
+// from the pin-init layout.
+type rustVendoredSynGraph struct {
+	hostLibraries     []RustHostLibrary
+	procMacros        []RustProcMacroProfile
+	zerocopy          RustCrateProfile
+	pinInitFlags      []string
+	moduleExterns     []string
+	bindgenRustTarget string
+}
+
+// rustMakeCrateFlags is one crate's <crate>-flags variable from rust/Makefile
+// with its cfgs expanded and its --extern dependencies separated.
+type rustMakeCrateFlags struct {
+	flags      []string
+	externs    []string
+	skipFlags  []string
+	predicates []RustVersionPredicate
+}
+
+// parseRustVendoredSynGraph reads the Linux 7.x crate recipes from
+// rust/Makefile and the module externs from scripts/Makefile.build.
+func parseRustVendoredSynGraph(rustMake, buildMake string) (*rustVendoredSynGraph, error) {
+	for _, marker := range []string{
+		"obj-$(CONFIG_RUST) += zerocopy.o",
+		"always-$(CONFIG_RUST) += host/libproc_macro2.rlib host/libquote.rlib host/libsyn.rlib",
+		"always-$(CONFIG_RUST) += $(libzerocopy_derive_name) $(libmacros_name) $(libpin_init_internal_name)",
+		"$(obj)/zerocopy.o:",
+		"cmd_rustc_procmacrolibrary =",
+		"--emit=link=$@ --crate-type rlib -O",
+		"--extern zerocopy --extern zerocopy_derive",
+	} {
+		if !strings.Contains(rustMake, marker) {
+			return nil, fmt.Errorf("unsupported vendored-syn rust/Makefile: missing %q", marker)
+		}
+	}
+	graph := &rustVendoredSynGraph{}
+	hostNames := map[string]bool{}
+	for _, name := range []string{"proc_macro2", "quote", "syn"} {
+		parsed, err := parseRustMakeCrateFlags(rustMake, name)
+		if err != nil {
+			return nil, err
+		}
+		for _, dep := range parsed.externs {
+			if !hostNames[dep] {
+				return nil, fmt.Errorf("host crate %s depends on unmodeled crate %s", name, dep)
+			}
+		}
+		directory := "rust/" + strings.ReplaceAll(name, "_", "-") + "/"
+		graph.hostLibraries = append(graph.hostLibraries, RustHostLibrary{
+			Name:              name,
+			Source:            directory + "lib.rs",
+			SourcePrefixes:    []string{directory},
+			Deps:              parsed.externs,
+			Flags:             parsed.flags,
+			SkipFlags:         parsed.skipFlags,
+			VersionPredicates: parsed.predicates,
+		})
+		hostNames[name] = true
+	}
+
+	macrosMatch := rustMacrosFlags.FindStringSubmatch(rustMake)
+	if macrosMatch == nil {
+		return nil, fmt.Errorf("unsupported vendored-syn rust/Makefile: missing macros proc-macro flags")
+	}
+	macrosWords := strings.Fields(macrosMatch[1])
+	if err := rejectMakeWords("macros proc-macro flags", macrosWords); err != nil {
+		return nil, err
+	}
+	macros := rustMakeCrateFlags{}
+	if err := splitRustExterns("macros proc-macro flags", macrosWords, &macros); err != nil {
+		return nil, err
+	}
+	procMacroFlags := map[string]rustMakeCrateFlags{"macros": macros}
+	for _, name := range []string{"zerocopy_derive", "pin_init_internal"} {
+		parsed, err := parseRustMakeCrateFlags(rustMake, name)
+		if err != nil {
+			return nil, err
+		}
+		if len(parsed.predicates) != 0 || len(parsed.skipFlags) != 0 {
+			return nil, fmt.Errorf("procedural macro %s has unsupported version-gated or skipped flags", name)
+		}
+		procMacroFlags[name] = parsed
+	}
+	for _, recipe := range []struct{ name, source, prefix string }{
+		{"zerocopy_derive", "rust/zerocopy-derive/lib.rs", "rust/zerocopy-derive/"},
+		{"macros", "rust/macros/lib.rs", "rust/macros/"},
+		{"pin_init_internal", "rust/pin-init/internal/src/lib.rs", "rust/pin-init/internal/src/"},
+	} {
+		parsed := procMacroFlags[recipe.name]
+		for _, dep := range parsed.externs {
+			if !hostNames[dep] {
+				return nil, fmt.Errorf("procedural macro %s depends on unmodeled crate %s", recipe.name, dep)
+			}
+		}
+		graph.procMacros = append(graph.procMacros, RustProcMacroProfile{
+			Name:           recipe.name,
+			Source:         recipe.source,
+			SourcePrefixes: []string{recipe.prefix},
+			SourceFiles:    []string{},
+			Deps:           parsed.externs,
+			Flags:          nonNilStrings(parsed.flags),
+			UsesRustcCfg:   true,
+		})
+	}
+
+	zerocopy, err := parseRustMakeCrateFlags(rustMake, "zerocopy")
+	if err != nil {
+		return nil, err
+	}
+	if len(zerocopy.externs) != 0 {
+		return nil, fmt.Errorf("zerocopy depends on unmodeled crates %q", zerocopy.externs)
+	}
+	envs, err := makeWords(rustMake, "zerocopy-envs")
+	if err != nil {
+		return nil, err
+	}
+	for _, env := range envs {
+		if !rustCrateEnv.MatchString(env) {
+			return nil, fmt.Errorf("unsupported zerocopy-envs entry %q", env)
+		}
+	}
+	empty := []string{}
+	graph.zerocopy = RustCrateProfile{
+		Name:              "zerocopy",
+		Source:            "rust/zerocopy/src/lib.rs",
+		SourcePrefixes:    []string{"rust/zerocopy/"},
+		SourceFiles:       empty,
+		GeneratedInputs:   empty,
+		Deps:              []string{"core", "compiler_builtins"},
+		Externs:           empty,
+		Flags:             nonNilStrings(zerocopy.flags),
+		SkipFlags:         nonNilStrings(zerocopy.skipFlags),
+		ObjcopyFlags:      empty,
+		Envs:              envs,
+		VersionPredicates: zerocopy.predicates,
+	}
+
+	pinInit, err := parseRustMakeCrateFlags(rustMake, "pin_init")
+	if err != nil {
+		return nil, err
+	}
+	if strings.Join(pinInit.externs, " ") != "pin_init_internal macros" ||
+		len(pinInit.predicates) != 0 || len(pinInit.skipFlags) != 0 {
+		return nil, fmt.Errorf("unsupported pin_init-flags layout")
+	}
+	graph.pinInitFlags = nonNilStrings(pinInit.flags)
+
+	start := strings.Index(buildMake, "rust_common_cmd =")
+	if start < 0 {
+		return nil, fmt.Errorf("unsupported scripts/Makefile.build: missing rust_common_cmd")
+	}
+	block := buildMake[start:]
+	if end := strings.Index(block, "\n\n"); end >= 0 {
+		block = block[:end]
+	}
+	for _, match := range rustExternFlag.FindAllStringSubmatch(block, -1) {
+		graph.moduleExterns = append(graph.moduleExterns, match[1])
+	}
+	if strings.Join(graph.moduleExterns, " ") != "pin_init kernel zerocopy zerocopy_derive" {
+		return nil, fmt.Errorf("unsupported module externs %q in rust_common_cmd", graph.moduleExterns)
+	}
+
+	target := rustBindgenTarget.FindStringSubmatch(rustMake)
+	if target == nil {
+		return nil, fmt.Errorf("unsupported vendored-syn rust/Makefile: missing bindgen --rust-target")
+	}
+	graph.bindgenRustTarget = target[1]
+	return graph, nil
+}
+
+func parseRustMakeCrateFlags(rustMake, crate string) (rustMakeCrateFlags, error) {
+	name := crate + "-flags"
+	value, err := makeValue(rustMake, name)
+	if err != nil {
+		return rustMakeCrateFlags{}, err
+	}
+	out := rustMakeCrateFlags{}
+	var cfgFlags []string
+	cfgCall := "$(call cfgs-to-flags,$(" + crate + "-cfgs))"
+	if strings.Contains(value, cfgCall) {
+		value = strings.ReplaceAll(value, cfgCall, " ")
+		cfgFlags, out.predicates, err = parseRustMakeCfgs(rustMake, crate)
+		if err != nil {
+			return rustMakeCrateFlags{}, err
+		}
+	}
+	words := strings.Fields(value)
+	if err := rejectMakeWords(name, words); err != nil {
+		return rustMakeCrateFlags{}, err
+	}
+	if err := splitRustExterns(name, words, &out); err != nil {
+		return rustMakeCrateFlags{}, err
+	}
+	out.flags = append(out.flags, cfgFlags...)
+	skipName := crate + "-skip_flags"
+	if regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(skipName) + `[ \t]*:?=`).MatchString(rustMake) {
+		out.skipFlags, err = makeWords(rustMake, skipName)
+		if err != nil {
+			return rustMakeCrateFlags{}, err
+		}
+		if err := rejectMakeWords(skipName, out.skipFlags); err != nil {
+			return rustMakeCrateFlags{}, err
+		}
+	}
+	return out, nil
+}
+
+// parseRustMakeCfgs expands a <crate>-cfgs variable to --cfg flags. A
+// $(if $(call rustc-min-version,N),cfgs) term becomes a version predicate.
+func parseRustMakeCfgs(rustMake, crate string) ([]string, []RustVersionPredicate, error) {
+	name := crate + "-cfgs"
+	value, err := makeValue(rustMake, name)
+	if err != nil {
+		return nil, nil, err
+	}
+	var predicates []RustVersionPredicate
+	for _, match := range rustMinVersionWords.FindAllStringSubmatch(value, -1) {
+		atLeast, err := decodeRustcVersion(match[1], name)
+		if err != nil {
+			return nil, nil, err
+		}
+		predicates = append(predicates, newRustVersionPredicate(atLeast, rustCfgFlags(strings.Fields(match[2])), nil, nil, nil))
+	}
+	words := strings.Fields(rustMinVersionWords.ReplaceAllString(value, " "))
+	if err := rejectMakeWords(name, words); err != nil {
+		return nil, nil, err
+	}
+	return rustCfgFlags(words), predicates, nil
+}
+
+func splitRustExterns(name string, words []string, out *rustMakeCrateFlags) error {
+	for i := 0; i < len(words); i++ {
+		if words[i] != "--extern" {
+			out.flags = append(out.flags, words[i])
+			continue
+		}
+		if i+1 == len(words) {
+			return fmt.Errorf("%s ends with --extern", name)
+		}
+		i++
+		out.externs = append(out.externs, words[i])
+	}
+	return nil
+}
+
+func rustCfgFlags(cfgs []string) []string {
+	flags := make([]string, 0, 2*len(cfgs))
+	for _, cfg := range cfgs {
+		flags = append(flags, "--cfg", cfg)
+	}
+	return flags
 }
 
 func rustGeneratedAssembly(sourceRoot, rustMake, layout string) ([]RustGeneratedAssembly, error) {
@@ -909,15 +1244,21 @@ func rustcMinimumVersion(content, context, pattern string) (string, error) {
 	if len(match) != 2 {
 		return "", fmt.Errorf("unsupported %s layout: missing rustc minimum-version predicate", context)
 	}
-	encoded, err := strconv.Atoi(match[1])
+	return decodeRustcVersion(match[1], context)
+}
+
+// decodeRustcVersion converts Kbuild's rustc-min-version encoding, such as
+// 108800, to a semver string.
+func decodeRustcVersion(value, context string) (string, error) {
+	encoded, err := strconv.Atoi(value)
 	if err != nil {
-		return "", fmt.Errorf("parse %s rustc minimum version %q: %w", context, match[1], err)
+		return "", fmt.Errorf("parse %s rustc minimum version %q: %w", context, value, err)
 	}
 	major := encoded / 100000
 	minor := (encoded / 100) % 1000
 	patch := encoded % 100
 	if major < 1 || minor > 999 || patch > 99 {
-		return "", fmt.Errorf("unsupported %s rustc minimum version %q", context, match[1])
+		return "", fmt.Errorf("unsupported %s rustc minimum version %q", context, value)
 	}
 	return fmt.Sprintf("%d.%d.%d", major, minor, patch), nil
 }
@@ -956,8 +1297,23 @@ func normalizeRustProfile(profile *RustProfile) {
 	profile.Module.AllowedFeatures = nonNilStrings(profile.Module.AllowedFeatures)
 	profile.Module.Flags = nonNilStrings(profile.Module.Flags)
 	profile.Module.VersionPredicates = nonNilRustVersionPredicates(profile.Module.VersionPredicates)
+	if profile.HostLibraries == nil {
+		profile.HostLibraries = []RustHostLibrary{}
+	}
+	for i := range profile.HostLibraries {
+		library := &profile.HostLibraries[i]
+		library.SourcePrefixes = nonNilStrings(library.SourcePrefixes)
+		library.Deps = nonNilStrings(library.Deps)
+		library.Flags = nonNilStrings(library.Flags)
+		library.SkipFlags = nonNilStrings(library.SkipFlags)
+		library.VersionPredicates = nonNilRustVersionPredicates(library.VersionPredicates)
+	}
+	for i := range profile.ProcMacros {
+		profile.ProcMacros[i].Deps = nonNilStrings(profile.ProcMacros[i].Deps)
+	}
 	for i := range profile.Crates {
 		crate := &profile.Crates[i]
+		crate.Envs = nonNilStrings(crate.Envs)
 		crate.VersionPredicates = nonNilRustVersionPredicates(crate.VersionPredicates)
 	}
 	profile.UnsupportedConfigs = nonNilStrings(profile.UnsupportedConfigs)
@@ -1008,6 +1364,20 @@ func rustProfileFileExists(root, path string) bool {
 }
 
 func makeWords(content, name string) ([]string, error) {
+	value, err := makeValue(content, name)
+	if err != nil {
+		return nil, err
+	}
+	words := strings.Fields(value)
+	if len(words) == 0 {
+		return nil, fmt.Errorf("%s assignment is empty", name)
+	}
+	return words, nil
+}
+
+// makeValue returns the first assignment to a Make variable with its
+// continuation lines joined.
+func makeValue(content, name string) (string, error) {
 	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
 	prefix := regexp.MustCompile(`^(?:export[ \t]+)?` + regexp.QuoteMeta(name) + `[ \t]*(?::=|\+=|=)[ \t]*(.*)$`)
 	for i, line := range lines {
@@ -1021,17 +1391,13 @@ func makeWords(content, name string) ([]string, error) {
 			value = strings.TrimSpace(strings.TrimSuffix(value, `\`))
 			i++
 			if i >= len(lines) {
-				return nil, fmt.Errorf("unterminated %s assignment", name)
+				return "", fmt.Errorf("unterminated %s assignment", name)
 			}
 			value += " " + strings.TrimSpace(lines[i])
 		}
-		words := strings.Fields(value)
-		if len(words) == 0 {
-			return nil, fmt.Errorf("%s assignment is empty", name)
-		}
-		return words, nil
+		return value, nil
 	}
-	return nil, fmt.Errorf("missing %s assignment", name)
+	return "", fmt.Errorf("missing %s assignment", name)
 }
 
 func removeMakeWords(words []string, removed string) []string {

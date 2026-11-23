@@ -2,6 +2,7 @@
 
 load("@llvm//toolchain:selects.bzl", "platform_module_map")
 load(":architecture_profiles.bzl", "linux_architecture_profiles")
+load(":kconfig_generator_repository.bzl", "kconfig_generator")
 load(":linux_image_repository.bzl", _linux_image_repository = "linux_image")
 load(":repository_utils.bzl", _repository_prefix = "repository_prefix")
 
@@ -186,9 +187,15 @@ def _root_tags(module_ctx):
             generated_repositories[repository] = name
     return images, overlays
 
+_GENERATOR_REPOSITORY = "linux_bzl_kconfig_generator"
+
 def _linux_images_impl(module_ctx):
     images, overlays = _root_tags(module_ctx)
     probe_tools = _llvm_probe_tools(module_ctx)
+    if images:
+        kconfig_generator(name = _GENERATOR_REPOSITORY)
+    generator_suffix = ".exe" if module_ctx.os.name.lower().startswith("windows") else ""
+    generator = "@%s//:kconfig_parse%s" % (_GENERATOR_REPOSITORY, generator_suffix)
     overlays_by_image = {}
     for (image, name), tag in overlays.items():
         if image not in images:
@@ -206,6 +213,7 @@ def _linux_images_impl(module_ctx):
                 name = graph_repo,
                 config = image.config,
                 config_mode = image.config_mode,
+                generator = generator,
                 overlays = image_overlays,
                 platform = image.platform,
                 probe_cc = probe_tools.cc,

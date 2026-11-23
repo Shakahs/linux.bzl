@@ -210,6 +210,9 @@ func IsRustToolchainValue(key string) bool {
 	switch key {
 	case "CONFIG_RUSTC_VERSION",
 		"CONFIG_RUSTC_LLVM_VERSION",
+		// Linux 7.x derives these from the selected rustc's LLVM release.
+		"CONFIG_RUSTC_LLVM_MAJOR_VERSION",
+		"CONFIG_RUSTC_CLANG_LLVM_COMPATIBLE",
 		"CONFIG_RUSTC_VERSION_TEXT",
 		"CONFIG_RUST_IS_AVAILABLE",
 		"CONFIG_HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC":

@@ -24,6 +24,7 @@ load(
     "directory_anchor",
     "path_mapped_run",
 )
+load(":source_include_directories.bzl", "source_include_directory_attrs", "source_include_directory_flags")
 
 visibility("public")
 
@@ -417,6 +418,7 @@ def _compile_arguments(ctx, base_flags, spec, source, output, config, generated_
         "-I" + include_dir
         for include_dir in _source_include_dirs(source_root, ctx.attr.srcarch, generated_headers)
     ])
+    object_args.extend(source_include_directory_flags(ctx))
     object_args.extend([
         _rewrite_source_root_flag(
             _expand_make_refs(flag, replacements, spec.object),
@@ -570,6 +572,7 @@ def _symversion_arguments(ctx, base_flags, spec, source, config, generated_heade
         "-I" + include_dir
         for include_dir in _source_include_dirs(source_root, ctx.attr.srcarch, generated_headers)
     ])
+    object_args.extend(source_include_directory_flags(ctx, "symversion_"))
     object_args.extend([
         _rewrite_source_root_flag(
             _expand_make_refs(flag, replacements, spec.object),
@@ -919,7 +922,7 @@ linux_object_action_group = rule(
             default = Label("//internal/cmd/sourceversioncmd"),
             executable = True,
         ),
-    },
+    } | source_include_directory_attrs() | source_include_directory_attrs("symversion_"),
     fragments = ["cpp"],
     toolchains = use_cc_toolchain(),
     doc = "Owns simple concrete compile actions with one recipe and reachability.",

@@ -148,6 +148,8 @@ func (s *linuxProbeShell) commandSucceeds(ctx context.Context, command string) (
 		return true, nil
 	case isKnownCCCanLinkProbe(command):
 		return false, nil
+	case isKnownOpenSSLKeyManagerProbe(command):
+		return false, nil
 	case isKnownStackProtectorProbe(command):
 		return true, nil
 	case isKnownRELRProbe(command):
@@ -292,11 +294,34 @@ func isLinuxProbeToolVersionCommand(command, tool string) bool {
 
 func isKnownBindgenVersionCommand(command string) bool {
 	fields := strings.Fields(command)
-	return len(fields) == 4 &&
-		linuxProbeToolName(fields[0]) == "bindgen" &&
-		fields[1] == "--version" &&
-		fields[2] == "workaround-for-0.69.0" &&
-		fields[3] == "2>/dev/null"
+	if len(fields) == 0 || linuxProbeToolName(fields[0]) != "bindgen" {
+		return false
+	}
+	switch len(fields) {
+	case 3:
+		// Linux 7.x dropped the bindgen 0.69.0 workaround argument.
+		return fields[1] == "--version" && fields[2] == "2>/dev/null"
+	case 4:
+		return fields[1] == "--version" &&
+			fields[2] == "workaround-for-0.69.0" &&
+			fields[3] == "2>/dev/null"
+	}
+	return false
+}
+
+// isKnownOpenSSLKeyManagerProbe recognizes certs/Kconfig's ML-DSA probe of the
+// host openssl, added in Linux 7.x. linux.bzl provides no openssl and builds
+// no signing keys, so the probe fails as it would without the tool.
+func isKnownOpenSSLKeyManagerProbe(command string) bool {
+	fields := strings.Fields(command)
+	return len(fields) == 7 &&
+		linuxProbeToolName(fields[0]) == "openssl" &&
+		fields[1] == "list" &&
+		fields[2] == "-key-managers" &&
+		fields[3] == "|" &&
+		fields[4] == "grep" &&
+		fields[5] == "-q" &&
+		strings.HasPrefix(fields[6], "ML-DSA-")
 }
 
 func isKnownRustAvailableProbe(command string) bool {

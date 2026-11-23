@@ -111,8 +111,12 @@ func NewLinuxToolProbe(opts LinuxToolProbeOptions) (*LinuxToolProbe, error) {
 	if err != nil {
 		return nil, err
 	}
-	if p.clangCode != linuxProbeCCVersion {
-		return nil, fmt.Errorf("probe clang version is %d, want pinned LLVM %d", p.clangCode, linuxProbeCCVersion)
+	// The probe tools come from the same LLVM module as the registered compile
+	// toolchain, so their measured version is the one compile actions use. The
+	// pinned baseline is the oldest release whose behavior the fixed probe
+	// tables describe.
+	if p.clangCode < linuxProbeCCVersion {
+		return nil, fmt.Errorf("probe clang version is %d, older than the LLVM %d baseline", p.clangCode, linuxProbeCCVersion)
 	}
 	lldText, err := p.run(ctx, lldPath, []string{"--version"}, nil)
 	if err != nil {
@@ -122,8 +126,8 @@ func NewLinuxToolProbe(opts LinuxToolProbeOptions) (*LinuxToolProbe, error) {
 	if err != nil {
 		return nil, err
 	}
-	if p.lldCode != linuxProbeLDVersion {
-		return nil, fmt.Errorf("probe ld.lld version is %d, want pinned LLVM %d", p.lldCode, linuxProbeLDVersion)
+	if p.lldCode != p.clangCode {
+		return nil, fmt.Errorf("probe ld.lld version is %d, want the probe clang's LLVM %d", p.lldCode, p.clangCode)
 	}
 	return p, nil
 }
@@ -139,6 +143,10 @@ func probeToolModeIsExecutable(goos string, mode os.FileMode) bool {
 }
 
 func (p *LinuxToolProbe) Identity() string { return p.identity }
+
+// ClangVersionText returns the first line of the measured clang --version, the
+// value Kbuild exports as CC_VERSION_TEXT.
+func (p *LinuxToolProbe) ClangVersionText() string { return p.clangVersion }
 
 func toolPairIdentity(paths ...string) (string, error) {
 	h := sha256.New()
@@ -607,6 +615,8 @@ func safeProbeOperand(option, operand string) bool {
 		case "-asan-kernel-mem-intrinsic-prefix=1", "-msan-disable-checks=1", "-tsan-compound-read-before-write=1", "-tsan-distinguish-volatile=1":
 			return true
 		}
+		// Linux 7.x's CC_OPT_INLINE_MEMSET probes this codegen threshold.
+		return regexp.MustCompile(`^-max-store-memset=[0-9]+$`).MatchString(operand)
 	}
 	return false
 }

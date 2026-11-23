@@ -153,6 +153,41 @@ def _target_link_flags(ctx, helpers, target):
         target.feature_configuration,
     )
 
+def _ubsan_cflags(config, source_root):
+    """Returns scripts/Makefile.ubsan's CFLAGS_UBSAN and CFLAGS_UBSAN_INTEGER_WRAP."""
+    values = config.config_flags
+    flags = []
+    if values.get("CONFIG_UBSAN") != "y":
+        return flags
+    for symbol, flag in [
+        ("CONFIG_UBSAN_ALIGNMENT", "-fsanitize=alignment"),
+        ("CONFIG_UBSAN_BOUNDS_STRICT", "-fsanitize=bounds-strict"),
+        ("CONFIG_UBSAN_ARRAY_BOUNDS", "-fsanitize=array-bounds"),
+        ("CONFIG_UBSAN_LOCAL_BOUNDS", "-fsanitize=local-bounds"),
+        ("CONFIG_UBSAN_SHIFT", "-fsanitize=shift"),
+        ("CONFIG_UBSAN_DIV_ZERO", "-fsanitize=integer-divide-by-zero"),
+        ("CONFIG_UBSAN_UNREACHABLE", "-fsanitize=unreachable"),
+        ("CONFIG_UBSAN_BOOL", "-fsanitize=bool"),
+        ("CONFIG_UBSAN_ENUM", "-fsanitize=enum"),
+    ]:
+        if values.get(symbol) == "y":
+            flags.append(flag)
+    if values.get("CONFIG_UBSAN_TRAP") == "y":
+        flags.append("-fsanitize-trap=undefined")
+    if values.get("CONFIG_UBSAN_SIGNED_WRAP") == "y":
+        flags.append("-fsanitize=signed-integer-overflow")
+    if values.get("CONFIG_UBSAN_INTEGER_WRAP") == "y":
+        flags.extend([
+            "-DINTEGER_WRAP",
+            "-fsanitize-undefined-ignore-overflow-pattern=all",
+            "-fsanitize=signed-integer-overflow",
+            "-fsanitize=unsigned-integer-overflow",
+            "-fsanitize=implicit-signed-integer-truncation",
+            "-fsanitize=implicit-unsigned-integer-truncation",
+            "-fsanitize-ignorelist=" + source_root + "/scripts/integer-wrap-ignore.scl",
+        ])
+    return flags
+
 def _module_metadata_sanitizer_flags(config, source_root, version):
     values = config.config_flags
     flags = []
@@ -193,34 +228,7 @@ def _module_metadata_sanitizer_flags(config, source_root, version):
             if values.get("CONFIG_CC_HAS_KASAN_MEMINTRINSIC_PREFIX") == "y":
                 flags.extend(["-mllvm", "-hwasan-kernel-mem-intrinsic-prefix=1"])
 
-    if values.get("CONFIG_UBSAN") == "y":
-        for symbol, flag in [
-            ("CONFIG_UBSAN_ALIGNMENT", "-fsanitize=alignment"),
-            ("CONFIG_UBSAN_BOUNDS_STRICT", "-fsanitize=bounds-strict"),
-            ("CONFIG_UBSAN_ARRAY_BOUNDS", "-fsanitize=array-bounds"),
-            ("CONFIG_UBSAN_LOCAL_BOUNDS", "-fsanitize=local-bounds"),
-            ("CONFIG_UBSAN_SHIFT", "-fsanitize=shift"),
-            ("CONFIG_UBSAN_DIV_ZERO", "-fsanitize=integer-divide-by-zero"),
-            ("CONFIG_UBSAN_UNREACHABLE", "-fsanitize=unreachable"),
-            ("CONFIG_UBSAN_BOOL", "-fsanitize=bool"),
-            ("CONFIG_UBSAN_ENUM", "-fsanitize=enum"),
-        ]:
-            if values.get(symbol) == "y":
-                flags.append(flag)
-        if values.get("CONFIG_UBSAN_TRAP") == "y":
-            flags.append("-fsanitize-trap=undefined")
-        if values.get("CONFIG_UBSAN_SIGNED_WRAP") == "y":
-            flags.append("-fsanitize=signed-integer-overflow")
-        if values.get("CONFIG_UBSAN_INTEGER_WRAP") == "y":
-            flags.extend([
-                "-DINTEGER_WRAP",
-                "-fsanitize-undefined-ignore-overflow-pattern=all",
-                "-fsanitize=signed-integer-overflow",
-                "-fsanitize=unsigned-integer-overflow",
-                "-fsanitize=implicit-signed-integer-truncation",
-                "-fsanitize=implicit-unsigned-integer-truncation",
-                "-fsanitize-ignorelist=" + source_root + "/scripts/integer-wrap-ignore.scl",
-            ])
+    flags.extend(_ubsan_cflags(config, source_root))
     if values.get("CONFIG_KCSAN") == "y" and _version_at_least(version, 6, 18):
         flags.extend([
             "-fsanitize=thread",
@@ -969,6 +977,7 @@ linux_module_actions = struct(
     compile_module_c = _compile_module_c,
     kernel_elf_class = _kernel_elf_class,
     module_metadata_sanitizer_flags = _module_metadata_sanitizer_flags,
+    ubsan_cflags = _ubsan_cflags,
     modpost_args = _modpost_args,
     module_map = _module_map,
     module_root_needs_objtool = _module_root_needs_objtool,

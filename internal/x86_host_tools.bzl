@@ -89,6 +89,7 @@ def linux_x86_host_tools(
 
     generated_headers = target_prefix + "_x86_generated_headers"
     objtool_inat_tables = target_prefix + "_x86_objtool_inat_tables"
+    objtool_feature_names = target_prefix + "_x86_objtool_feature_names"
     objtool_inputs = target_prefix + "_x86_objtool_inputs"
     objtool = target_prefix + "_x86_objtool"
     relocs_sources = target_prefix + "_x86_relocs_sources"
@@ -144,16 +145,34 @@ def linux_x86_host_tools(
         visibility = visibility,
     )
 
+    # Linux 7.x's objtool includes the CPU feature names generated from the
+    # tools copy of cpufeatures.h, next to inat-tables.c.
+    genrule_feature_names_out = target_prefix + "_x86_objtool_inat/arch/x86/lib/cpu-feature-names.c"
+    tools_cpufeatures_h = source_label(source_repo, "tools/arch/x86/include/asm/cpufeatures.h")
+    run_binary(
+        name = objtool_feature_names,
+        srcs = [tools_cpufeatures_h],
+        outs = [genrule_feature_names_out],
+        args = [
+            "-in",
+            "$(location %s)" % tools_cpufeatures_h,
+            "-out",
+            "$(location %s)" % genrule_feature_names_out,
+        ],
+        tool = Label("//tools:cpufeaturenames"),
+        visibility = visibility,
+    )
+
     cc_library(
         name = objtool_inputs,
         includes = [genrule_inat_out[:-len("/inat-tables.c")]],
-        textual_hdrs = [":" + objtool_inat_tables] + source_labels(source_repo, _X86_OBJTOOL_TEXTUAL_SRCS),
+        textual_hdrs = [":" + objtool_inat_tables, ":" + objtool_feature_names] + source_labels(source_repo, _X86_OBJTOOL_TEXTUAL_SRCS),
         visibility = visibility,
     )
 
     cc_binary(
         name = objtool,
-        srcs = source_labels(source_repo, _X86_OBJTOOL_SRCS),
+        srcs = source_labels(source_repo, _X86_OBJTOOL_SRCS) + [source_label(source_repo, "objtool_release_srcs")],
         copts = [
             "-D_GNU_SOURCE",
             "-Dbswap_16=__bswap_16",

@@ -298,6 +298,15 @@ func linuxCFlags(config map[string]string, arch, version string) []string {
 		"-Wno-pointer-sign",
 		"-Wno-trigraphs",
 	}
+	// CC_FLAGS_DIALECT: Linux 7.x lets a struct embed a tagged struct
+	// anonymously with the option Kconfig selects, and disables Clang's warning
+	// about that extension.
+	if msExtensions := strings.Fields(unquote(config["CONFIG_CC_MS_EXTENSIONS"])); len(msExtensions) != 0 {
+		flags = append(flags, msExtensions...)
+		if enabled(config, "CONFIG_CC_IS_CLANG") {
+			flags = append(flags, "-Wno-microsoft-anon-tag")
+		}
+	}
 	if enabled(config, "CONFIG_CC_IS_CLANG") {
 		flags = append(flags,
 			"-fno-addrsig",
@@ -348,6 +357,15 @@ func linuxCFlags(config map[string]string, arch, version string) []string {
 		if enabled(config, "CONFIG_CC_HAS_AUTO_VAR_INIT_ZERO_ENABLER") {
 			flags = append(flags, "-enable-trivial-auto-var-init-zero-knowing-it-will-be-removed-from-clang")
 		}
+	}
+	// Linux 7.x: typed kmalloc partitions bound Clang's allocation tokens to
+	// KMALLOC_PARTITION_CACHES_NR + 1, and __counted_by_ptr may name a member
+	// declared after the pointer.
+	if enabled(config, "CONFIG_KMALLOC_PARTITION_TYPED") {
+		flags = append(flags, "-falloc-token-max=16")
+	}
+	if enabled(config, "CONFIG_CC_IS_CLANG") && enabled(config, "CONFIG_CC_HAS_COUNTED_BY_PTR") {
+		flags = append(flags, "-fexperimental-late-parse-attributes")
 	}
 	if enabled(config, "CONFIG_ZERO_CALL_USED_REGS") {
 		flags = append(flags, "-fzero-call-used-regs=used-gpr")

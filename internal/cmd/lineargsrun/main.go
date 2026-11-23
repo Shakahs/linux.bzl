@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-const usage = "usage: lineargsrun -args_file FILE -output FILE -- TOOL [ARG...]"
+const usage = "usage: lineargsrun [-args_file FILE] -output FILE -- TOOL [ARG...]"
 
 type config struct {
 	argsFile string
@@ -46,8 +46,8 @@ func parseArgs(args []string) (config, error) {
 	if flags.NArg() != 0 {
 		return config{}, fmt.Errorf("unexpected argument before -- separator: %q", flags.Arg(0))
 	}
-	if cfg.argsFile == "" || cfg.output == "" {
-		return config{}, errors.New("-args_file and -output are required")
+	if cfg.output == "" {
+		return config{}, errors.New("-output is required")
 	}
 	cfg.tool = args[separator+1]
 	cfg.toolArgs = append([]string(nil), args[separator+2:]...)
@@ -68,37 +68,124 @@ func readLineArgs(path string) ([]string, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		args = append(args, strings.Fields(line)...)
+		words, err := shellWords(line)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		args = append(args, words...)
 	}
 	return args, scanner.Err()
 }
 
-func expandedArgs(template, fileArgs []string, output string) ([]string, error) {
+// shellWords splits line as sh splits a command line, removing single quotes,
+// double quotes and backslash escapes. Kbuild substitutes the bindgen
+// parameters into a shell recipe, so a quoted value such as
+// lru_status='#[cfi_encoding="10lru_status"]' reaches bindgen unquoted.
+func shellWords(line string) ([]string, error) {
+	var words []string
+	var word strings.Builder
+	inWord := false
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		switch {
+		case c == ' ' || c == '\t':
+			if inWord {
+				words = append(words, word.String())
+				word.Reset()
+				inWord = false
+			}
+		case c == '\'':
+			end := strings.IndexByte(line[i+1:], '\'')
+			if end < 0 {
+				return nil, errors.New("unterminated single quote")
+			}
+			word.WriteString(line[i+1 : i+1+end])
+			i += end + 1
+			inWord = true
+		case c == '"':
+			i++
+			for ; i < len(line) && line[i] != '"'; i++ {
+				if line[i] == '\\' && i+1 < len(line) && strings.IndexByte("$`\"\\", line[i+1]) >= 0 {
+					i++
+				}
+				word.WriteByte(line[i])
+			}
+			if i >= len(line) {
+				return nil, errors.New("unterminated double quote")
+			}
+			inWord = true
+		case c == '\\' && i+1 < len(line):
+			i++
+			word.WriteByte(line[i])
+			inWord = true
+		default:
+			word.WriteByte(c)
+			inWord = true
+		}
+	}
+	if inWord {
+		words = append(words, word.String())
+	}
+	return words, nil
+}
+
+// readResponseFile reads a compiler response file that holds one argument per
+// line, as kernelflags writes them.
+func readResponseFile(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var args []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line != "" {
+			args = append(args, line)
+		}
+	}
+	return args, nil
+}
+
+// expandedArgs substitutes the placeholders in template and expands @FILE
+// response files, which libclang-based tools such as bindgen do not read.
+func expandedArgs(template []string, argsFile string, fileArgs []string, output string) ([]string, error) {
 	var out []string
 	foundFile := false
 	for _, arg := range template {
-		switch arg {
-		case "{args_file}":
+		switch {
+		case arg == "{args_file}":
 			foundFile = true
 			out = append(out, fileArgs...)
-		case "{output}":
+		case arg == "{output}":
 			out = append(out, output)
+		case strings.HasPrefix(arg, "@") && len(arg) > 1:
+			response, err := readResponseFile(arg[1:])
+			if err != nil {
+				return nil, fmt.Errorf("read response file: %w", err)
+			}
+			out = append(out, response...)
 		default:
 			out = append(out, arg)
 		}
 	}
-	if !foundFile {
+	if argsFile != "" && !foundFile {
 		return nil, errors.New("TOOL arguments are missing {args_file}")
+	}
+	if argsFile == "" && foundFile {
+		return nil, errors.New("TOOL arguments use {args_file} without -args_file")
 	}
 	return out, nil
 }
 
 func run(cfg config, stdout, stderr io.Writer) error {
-	fileArgs, err := readLineArgs(cfg.argsFile)
-	if err != nil {
-		return err
+	var fileArgs []string
+	if cfg.argsFile != "" {
+		var err error
+		fileArgs, err = readLineArgs(cfg.argsFile)
+		if err != nil {
+			return err
+		}
 	}
-	args, err := expandedArgs(cfg.toolArgs, fileArgs, cfg.output)
+	args, err := expandedArgs(cfg.toolArgs, cfg.argsFile, fileArgs, cfg.output)
 	if err != nil {
 		return err
 	}

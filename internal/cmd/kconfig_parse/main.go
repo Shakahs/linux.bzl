@@ -87,10 +87,13 @@ func measuredLinuxProbeShell(
 	env stringMapFlag,
 ) (func(context.Context, string) (string, error), error) {
 	for name, value := range fixedLinuxProbeEnvironment {
-		if name == "CC" {
+		switch name {
+		case "CC":
 			value = ccPath
-		} else if name == "LD" {
+		case "LD":
 			value = ldPath
+		case "CC_VERSION_TEXT":
+			value = probe.ClangVersionText()
 		}
 		if configured, ok := env[name]; ok && configured != value {
 			return nil, fmt.Errorf("measured Linux probe requires %s=%q, got %q", name, value, configured)
@@ -602,6 +605,10 @@ func run() (exitCode int) {
 			if objectPkg == "" {
 				objectPkg = inferLabelPackage(*compactBuildfileOut)
 			}
+			buildSourceRoot := ""
+			if *root != "" {
+				buildSourceRoot = filepath.Dir(workspacePath(*root))
+			}
 			data, err := metadata.BuildFile(kconfig.CompactBuildFileOptions{
 				Arch:               vars["ARCH"],
 				Version:            *kernelVersion,
@@ -616,6 +623,7 @@ func run() (exitCode int) {
 				SourceObjtool:      *sourceObjtool,
 				SourceRelacheck:    *sourceRelacheck,
 				SourceRootLabel:    *sourceRootLabel,
+				SourceRoot:         buildSourceRoot,
 				Srcarch:            vars["SRCARCH"],
 			})
 			if err != nil {

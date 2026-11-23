@@ -24,6 +24,11 @@ var knownSymbols = []string{
 	"int80_landing_pad",
 	"vdso32_rt_sigreturn_landing_pad",
 	"vdso32_sigreturn_landing_pad",
+	// Linux 7.x robust-futex unlock critical sections.
+	"__futex_list64_try_unlock_cs_start",
+	"__futex_list64_try_unlock_cs_end",
+	"__futex_list32_try_unlock_cs_start",
+	"__futex_list32_try_unlock_cs_end",
 }
 
 func main() {

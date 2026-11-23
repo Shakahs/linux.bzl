@@ -4,6 +4,7 @@ load("@rules_cc//cc:action_names.bzl", "CPP_LINK_EXECUTABLE_ACTION_NAME", "C_COM
 load("@rules_cc//cc:find_cc_toolchain.bzl", "find_cpp_toolchain", "use_cc_toolchain")
 load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
 load(":host_cc_toolchain.bzl", "host_cc_toolchain", "host_cc_toolchain_attr")
+load(":linux_module_actions.bzl", "linux_module_actions")
 load(":linux_objects.bzl", "LinuxConfigInfo", "LinuxGeneratedHeadersInfo", "linux_module_cc_helpers")
 load(
     ":path_mapping.bzl",
@@ -115,7 +116,7 @@ def _decode_rust_profile(profile_json, arch):
             "unsupported Rust profile schema %r; expected %r" %
             (profile.get("schema"), _RUST_PROFILE_SCHEMA),
         )
-    if profile.get("source_layout") not in ["legacy", "pin-init"]:
+    if profile.get("source_layout") not in ["legacy", "pin-init", "vendored-syn"]:
         fail("unsupported Rust profile source layout %r" % profile.get("source_layout"))
     architecture = profile.get("architecture")
     expected_architecture = {
@@ -143,9 +144,15 @@ def _decode_rust_profile(profile_json, arch):
         "unsupported_configs",
     ]:
         _required_profile_field(profile, field, "list")
-    if type(profile.get("generated_assembly", [])) != "list":
-        fail("Rust profile field generated_assembly must be a list")
+    for field in ["generated_assembly", "host_libraries"]:
+        if type(profile.get(field, [])) != "list":
+            fail("Rust profile field %s must be a list" % field)
     return profile
+
+def _optional_profile_string_list(value, name):
+    if name not in value:
+        return []
+    return _profile_string_list(value, name)
 
 def _profile_version_predicates(value, name, config, replacements):
     predicates = _required_profile_field(value, "version_predicates", "list")
@@ -353,12 +360,17 @@ def _run_rustc(
         objtree_anchor = None,
         transitive_tool_inputs = [],
         include_rust_std = False,
-        version_predicates = []):
+        version_predicates = [],
+        extra_env = []):
     runner_args = ctx.actions.args()
     runner_args.add("-cwd", ".")
     env = _rust_env(compiler)
     for name in sorted(env.keys()):
         runner_args.add("-env", name + "=" + env[name])
+    for entry in extra_env:
+        if "=" not in entry or entry.startswith("="):
+            fail("Rust profile environment entry %r must be NAME=VALUE" % entry)
+        runner_args.add("-env", entry)
     if objtree_anchor != None:
         runner_args.add("-env")
         add_directory_arg(
@@ -527,7 +539,6 @@ def _unsupported_rust_config_symbols(config, profile = None):
         "CONFIG_SHADOW_CALL_STACK",
         "CONFIG_KASAN",
         "CONFIG_KCSAN",
-        "CONFIG_UBSAN",
         "CONFIG_KCOV",
         "CONFIG_DEBUG_INFO_DWARF4",
         "CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT",
@@ -696,6 +707,9 @@ def _run_bindgen_with_parameters(
     if mode != None:
         raw = ctx.actions.declare_file(output.basename + ".raw", sibling = output)
     args = ctx.actions.args()
+
+    # lineargsrun reads the bindgen parameters file and expands the kernel C
+    # flags' response files, which bindgen's libclang does not read.
     args.add("-args_file", parameters)
     args.add("-output", raw)
     args.add("--")
@@ -740,12 +754,18 @@ def _run_helpers_bindgen(
         rust_dir_anchor):
     raw = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/rust/bindings/bindings_helpers_generated.rs.raw")
     args = ctx.actions.args()
+
+    # lineargsrun expands the kernel C flags' response files, which bindgen's
+    # libclang does not read.
+    args.add("-output", raw)
+    args.add("--")
+    args.add(bindgen)
     args.add(source)
     args.add("--blocklist-type", ".*")
     args.add("--allowlist-var", "")
     args.add("--allowlist-function", "rust_helper_.*")
     args.add_all(common_flags)
-    args.add("-o", raw)
+    args.add("-o", "{output}")
     args.add("--")
     _add_kernel_c_flags(args, c_flags)
     add_directory_arg(args, rust_dir_anchor, format = "-I%s")
@@ -753,7 +773,7 @@ def _run_helpers_bindgen(
     args.add("-Wno-missing-declarations")
     path_mapped_run(
         ctx.actions,
-        executable = bindgen,
+        executable = ctx.executable._lineargsrun,
         inputs = depset(
             [source],
             transitive = [
@@ -762,7 +782,7 @@ def _run_helpers_bindgen(
                 source_tree,
             ],
         ),
-        tools = cc_toolchain.all_files,
+        tools = depset([bindgen], transitive = [cc_toolchain.all_files]),
         outputs = [raw],
         arguments = [args],
         mnemonic = "LinuxRustBindgenHelpers",
@@ -850,7 +870,8 @@ def _rust_crate(
         dep_inputs,
         crate_flags = [],
         skip_flags = [],
-        objcopy_flags = []):
+        objcopy_flags = [],
+        envs = []):
     raw_object = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/rust/" + crate + ".rustc.o")
     metadata = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/rust/lib" + crate + ".rmeta")
     flags = [
@@ -891,6 +912,7 @@ def _rust_crate(
         },
         objtree_anchor = objtree_anchor,
         version_predicates = version_predicates,
+        extra_env = envs,
     )
     processed = raw_object
     if objcopy_flags:
@@ -921,6 +943,75 @@ def _export_header(ctx, cc_toolchain, object, name):
     _postprocess(ctx, "exports", symbols, out)
     return out
 
+def _host_sysroot_directories(host_rust_toolchain):
+    return {
+        host_rust_toolchain.sysroot: directory_anchor(
+            host_rust_toolchain.sysroot_anchor,
+            host_rust_toolchain.sysroot,
+        ),
+    }
+
+def _host_dependency_args(args, mapped_directories, host_deps):
+    """Adds -L and --extern flags for host rlibs, as Kbuild's rust/host does."""
+    if not host_deps:
+        return []
+    dep_files = [host_deps[name] for name in host_deps]
+    host_dir = dep_files[0].dirname
+    args.append("-L" + host_dir)
+    mapped_directories[host_dir] = directory_anchor(dep_files[0])
+    for name in host_deps:
+        args.extend(["--extern", name])
+    return dep_files
+
+def _host_library(
+        ctx,
+        rustc_probe,
+        host_rust_toolchain,
+        common_flags,
+        name,
+        source,
+        source_inputs,
+        host_deps,
+        crate_flags = [],
+        skip_flags = [],
+        version_predicates = []):
+    output = ctx.actions.declare_file(
+        ctx.label.name + ".rust_sdk/rust/host/lib" + name + ".rlib",
+    )
+    args = [
+        flag
+        for flag in common_flags
+        if flag not in skip_flags
+    ]
+    args.extend(crate_flags)
+    args.append("--sysroot=" + host_rust_toolchain.sysroot)
+    mapped_directories = _host_sysroot_directories(host_rust_toolchain)
+    dep_files = _host_dependency_args(args, mapped_directories, host_deps)
+    args.extend([
+        "--emit=link=" + output.path,
+        "--crate-type",
+        "rlib",
+        "-O",
+        "--crate-name",
+        name,
+        source.path,
+    ])
+    _run_rustc(
+        ctx,
+        rustc_probe,
+        host_rust_toolchain,
+        args,
+        source_inputs + dep_files,
+        [output],
+        "LinuxRustHostLibrary",
+        "Compiling Rust-for-Linux host crate %s %%{label}" % name,
+        mapped_files = [output, source] + dep_files,
+        mapped_directories = mapped_directories,
+        include_rust_std = True,
+        version_predicates = version_predicates,
+    )
+    return output
+
 def _proc_macro(
         ctx,
         rustc_probe,
@@ -934,7 +1025,8 @@ def _proc_macro(
         source_inputs,
         uses_rustc_cfg,
         crate_flags = [],
-        version_predicates = []):
+        version_predicates = [],
+        host_deps = {}):
     extension = host_rust_toolchain.dylib_ext
     output = ctx.actions.declare_file(
         ctx.label.name + ".rust_sdk/rust/lib" + name + extension,
@@ -944,6 +1036,8 @@ def _proc_macro(
     args.append("--sysroot=" + host_rust_toolchain.sysroot)
     host_link = _host_rust_link(host_cc, host_features)
     args.extend(host_link.flags)
+    mapped_directories = _host_sysroot_directories(host_rust_toolchain)
+    dep_files = _host_dependency_args(args, mapped_directories, host_deps)
     args.extend([
         "--emit=link=" + output.path,
         "--extern",
@@ -953,7 +1047,7 @@ def _proc_macro(
         "--crate-name",
         name,
     ])
-    inputs = list(source_inputs)
+    inputs = list(source_inputs) + dep_files
     if uses_rustc_cfg:
         args.append("@" + config.rustc_cfg.path)
         inputs.append(config.rustc_cfg)
@@ -967,13 +1061,8 @@ def _proc_macro(
         [output],
         "LinuxRustProcMacro",
         "Compiling Rust-for-Linux procedural macro %s %%{label}" % name,
-        mapped_files = [output, source, config.rustc_cfg] + host_link.mapped_files,
-        mapped_directories = {
-            host_rust_toolchain.sysroot: directory_anchor(
-                host_rust_toolchain.sysroot_anchor,
-                host_rust_toolchain.sysroot,
-            ),
-        },
+        mapped_files = [output, source, config.rustc_cfg] + host_link.mapped_files + dep_files,
+        mapped_directories = mapped_directories,
         transitive_tool_inputs = [host_cc.all_files, host_link.runtime_files],
         include_rust_std = True,
         version_predicates = version_predicates,
@@ -1224,6 +1313,59 @@ def _linux_rust_kernel_sdk_impl(ctx):
         generated_inputs[output_path] = generated
         generated_arch_sources.append(generated)
 
+    host_libraries = {}
+    for recipe in profile.get("host_libraries", []):
+        if type(recipe) != "dict":
+            fail("Rust profile host_libraries entries must be objects")
+        name = _validate_profile_name(
+            _required_profile_field(recipe, "name", "string"),
+            "host_libraries.name",
+        )
+        if name in host_libraries:
+            fail("Rust profile contains duplicate host library %r" % name)
+        source_path = _validate_profile_path(
+            _required_profile_field(recipe, "source", "string"),
+            "host_libraries.source",
+        )
+        host_deps = {}
+        for dep in _profile_string_list(recipe, "deps"):
+            if dep not in host_libraries:
+                fail(
+                    ("Rust profile host library %s depends on unavailable host library %s; " +
+                     "host libraries must be topologically ordered") % (name, dep),
+                )
+            host_deps[dep] = host_libraries[dep]
+        host_libraries[name] = _host_library(
+            ctx,
+            rustc_probe,
+            host_rust_toolchain,
+            common_flags.flags,
+            name,
+            _source_file(source_files, source_path),
+            _profile_inputs(
+                source_files,
+                _profile_string_list(recipe, "source_prefixes"),
+                [source_path],
+            ),
+            host_deps,
+            crate_flags = _expand_profile_values(
+                _required_profile_field(recipe, "flags", "list"),
+                config,
+                replacements,
+            ),
+            skip_flags = _expand_profile_values(
+                _required_profile_field(recipe, "skip_flags", "list"),
+                config,
+                replacements,
+            ),
+            version_predicates = common_flags.predicates + _profile_version_predicates(
+                recipe,
+                "host_libraries",
+                config,
+                replacements,
+            ),
+        )
+
     proc_macros = {}
     for recipe in profile["proc_macros"]:
         if type(recipe) != "dict":
@@ -1232,8 +1374,13 @@ def _linux_rust_kernel_sdk_impl(ctx):
             _required_profile_field(recipe, "name", "string"),
             "proc_macros.name",
         )
-        if name in proc_macros:
+        if name in proc_macros or name in host_libraries:
             fail("Rust profile contains duplicate proc macro %r" % name)
+        proc_macro_deps = {}
+        for dep in _optional_profile_string_list(recipe, "deps"):
+            if dep not in host_libraries:
+                fail("Rust profile proc macro %s depends on unavailable host library %s" % (name, dep))
+            proc_macro_deps[dep] = host_libraries[dep]
         source_path = _validate_profile_path(
             _required_profile_field(recipe, "source", "string"),
             "proc_macros.source",
@@ -1261,6 +1408,7 @@ def _linux_rust_kernel_sdk_impl(ctx):
                 replacements,
             ),
             version_predicates = common_flags.predicates,
+            host_deps = proc_macro_deps,
         )
 
     crates = {}
@@ -1362,6 +1510,11 @@ def _linux_rust_kernel_sdk_impl(ctx):
                 config,
                 replacements,
             ),
+            envs = _expand_profile_values(
+                _optional_profile_string_list(recipe, "envs"),
+                config,
+                replacements,
+            ),
         )
         crate_order.append(name)
 
@@ -1375,10 +1528,12 @@ def _linux_rust_kernel_sdk_impl(ctx):
         c_flags,
         helpers_source,
         "rust/helpers/helpers.o",
+        # Kbuild instruments the helpers like any C kernel object; rustc
+        # receives no UBSAN flags.
         extra_flags = [
             "-Wno-missing-prototypes",
             "-Wno-missing-declarations",
-        ],
+        ] + linux_module_actions.ubsan_cflags(config, source_root),
     )
     export_profile = profile["exports"]
     export_headers = []

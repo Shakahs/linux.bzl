@@ -58,6 +58,9 @@ register_toolchains(
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
 go_sdk.nogo(nogo = "@rules_go//:tools_nogo")
 
+# The image extension compiles the Kconfig graph generator with this SDK.
+use_repo(go_sdk, "go_host_compatible_sdk_label")
+
 go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
 go_deps.from_file(go_mod = "//:go.mod")
 use_repo(go_deps, "com_github_bazelbuild_buildtools")

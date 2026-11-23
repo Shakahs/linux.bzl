@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -128,7 +129,10 @@ type CompactBuildFileOptions struct {
 	SourceObjtool      string
 	SourceRelacheck    string
 	SourceRootLabel    string
-	Srcarch            string
+	// SourceRoot is the Linux tree that SourceLabelPackage labels; include
+	// directories are passed as labels only when the directory exists there.
+	SourceRoot string
+	Srcarch    string
 }
 
 type CompactMetadataOptions struct {
@@ -1595,7 +1599,7 @@ func (memo compactVariantMemo) variantForStack(
 			scanner,
 			source,
 			flags,
-			compactIntrinsicIncludeRoots(source),
+			appendUniqueStrings(compactIntrinsicIncludeRoots(source), specialSources.includeRoots...),
 		)
 		if err != nil {
 			return CompactObjectVariant{}, fmt.Errorf(
@@ -2162,12 +2166,64 @@ func compactObjectActionFootprintForObject(object string, flags []string) compac
 	return footprint
 }
 
+// Linux 7.x builds each x86 vDSO image in its own directory below
+// arch/x86/entry/vdso, sharing sources from arch/x86/entry/vdso/common.
+const (
+	x86VDSO64ImageObject = "arch/x86/entry/vdso/vdso64/vdso64-image.o"
+	x86VDSO32ImageObject = "arch/x86/entry/vdso/vdso32/vdso32-image.o"
+)
+
 func isMultiSourceImageObject(object string) bool {
 	return strings.HasPrefix(object, "arch/x86/entry/vdso/vdso-image-") ||
+		object == x86VDSO64ImageObject ||
+		object == x86VDSO32ImageObject ||
 		object == "arch/x86/realmode/rmpiggy.o" ||
 		object == "arch/x86/purgatory/kexec-purgatory.o" ||
 		object == "arch/riscv/purgatory/kexec-purgatory.o" ||
 		object == "arch/powerpc/purgatory/kexec-purgatory.o"
+}
+
+// compactX86VDSOSources describes the Linux 7.x x86 vDSO image actions in
+// arch/x86/entry/vdso/common/Makefile.include. Config-selected objects, such
+// as vsgx.o and vfutex.o, are scanned unconditionally; the image action
+// compiles only the configured ones.
+func compactX86VDSOSources(object string) compactSpecialSourceInputs {
+	directory := filepath.ToSlash(filepath.Dir(object))
+	sources := []string{"note.S", "vclock_gettime.c", "vgetcpu.c", "vfutex.c"}
+	linkerScript := "vdso64.lds.S"
+	flags := []string{"-DBUILD_VDSO", "-DBUILD_VDSO64", "-D__DISABLE_EXPORTS", "-DDISABLE_BRANCH_PROFILING"}
+	profile := sourceScanKernel
+	if object == x86VDSO64ImageObject {
+		sources = append(sources, "vgetrandom.c", "vgetrandom-chacha.S", "vsgx.S")
+	} else {
+		sources = append(sources, "system_call.S", "sigreturn.S")
+		linkerScript = "vdso32.lds.S"
+		flags = []string{"-DBUILD_VDSO", "-DBUILD_VDSO32", "-D__DISABLE_EXPORTS", "-DDISABLE_BRANCH_PROFILING"}
+		profile = sourceScanX86VDSO32
+	}
+	roots := []string{"arch/x86/entry/vdso", ""}
+	inputs := make([]compactSpecialSourceInput, 0, len(sources)+3)
+	for _, source := range sources {
+		inputs = append(inputs, compactSpecialSourceInput{
+			path:     directory + "/" + source,
+			flags:    flags,
+			compiled: true,
+			profile:  profile,
+		})
+	}
+	// Kbuild preprocesses the linker scripts without the vDSO object flags.
+	inputs = append(inputs,
+		compactSpecialSourceInput{path: directory + "/" + linkerScript, compiled: true},
+		compactSpecialSourceInput{path: "arch/x86/include/asm/vdso.h"},
+	)
+	if object == x86VDSO32ImageObject {
+		inputs = append(inputs, compactSpecialSourceInput{path: directory + "/fake_32bit_build.h"})
+	}
+	return compactSpecialSourceInputs{
+		primary:      directory + "/note.S",
+		includeRoots: roots,
+		inputs:       inputs,
+	}
 }
 
 func flagsNeedUTSVersionTmp(flags []string) bool {
@@ -2205,6 +2261,8 @@ func compactSpecialSourcesForObject(object string) compactSpecialSourceInputs {
 			includeRoots: []string{"arch/x86/entry/vdso"},
 			inputs:       inputs,
 		}
+	case x86VDSO64ImageObject, x86VDSO32ImageObject:
+		return compactX86VDSOSources(object)
 	case "arch/x86/realmode/rmpiggy.o":
 		return compactSpecialSourceInputs{
 			includeRoots: []string{
@@ -2578,8 +2636,13 @@ func normalizeSourceRootFlags(flags []string, sourceRoot string) []string {
 	}
 	out := make([]string, len(flags))
 	changed := false
+	includeDirectoryOperand := false
 	for i, flag := range flags {
 		normalized := normalizeSourceRootFlag(flag, sourceRoot)
+		if includeDirectoryOperand {
+			normalized = treeRootedIncludeDirectory(normalized)
+		}
+		includeDirectoryOperand = isIncludeDirectoryOption(flag)
 		if normalized != flag {
 			changed = true
 		}
@@ -2591,8 +2654,112 @@ func normalizeSourceRootFlags(flags []string, sourceRoot string) []string {
 	return out
 }
 
+// compactIncludeDirectoryAttrs names the label-list attributes that carry an
+// object's source-tree include directories, one per compiler option.
+var compactIncludeDirectoryAttrs = []struct {
+	option string
+	attr   string
+}{
+	{"-idirafter", "after_include_directories"},
+	{"-iquote", "quote_include_directories"},
+	{"-isystem", "system_include_directories"},
+	{"-I", "include_directories"},
+}
+
+// sourceTreeIncludeDirectory reports the include-directory attribute and tree
+// path of flags[i] when it names a directory under $(srctree), and how many
+// further flags the option consumes.
+func sourceTreeIncludeDirectory(flags []string, i int) (string, string, int, bool) {
+	for _, entry := range compactIncludeDirectoryAttrs {
+		operand, consumed := "", 0
+		switch {
+		case flags[i] == entry.option && i+1 < len(flags):
+			operand, consumed = flags[i+1], 1
+		case strings.HasPrefix(flags[i], entry.option) && len(flags[i]) > len(entry.option):
+			operand = flags[i][len(entry.option):]
+		default:
+			continue
+		}
+		path, ok := strings.CutPrefix(operand, "$(srctree)/")
+		if !ok || path == "" || strings.Contains(path, "$(") || strings.Contains(path, "${") {
+			return "", "", 0, false
+		}
+		return entry.attr, path, consumed, true
+	}
+	return "", "", 0, false
+}
+
+// splitSourceTreeIncludeDirectories moves the flags that name include
+// directories under $(srctree) out of flags. The BUILD file passes those
+// directories to compile rules as labels of the source repository's
+// directories, in their original order per option. Clang ignores a missing
+// include directory, and a missing directory has no label, so such flags are
+// dropped.
+func splitSourceTreeIncludeDirectories(flags []string, sourceRoot string) ([]string, map[string][]string) {
+	dirs := map[string][]string{}
+	if sourceRoot == "" {
+		return flags, dirs
+	}
+	rest := make([]string, 0, len(flags))
+	for i := 0; i < len(flags); i++ {
+		attr, path, consumed, ok := sourceTreeIncludeDirectory(flags, i)
+		if !ok {
+			rest = append(rest, flags[i])
+			continue
+		}
+		i += consumed
+		if info, err := os.Stat(filepath.Join(sourceRoot, filepath.FromSlash(path))); err != nil || !info.IsDir() {
+			continue
+		}
+		if !slices.Contains(dirs[attr], path) {
+			dirs[attr] = append(dirs[attr], path)
+		}
+	}
+	return rest, dirs
+}
+
+// setSourceIncludeDirectoryAttrs sets the include-directory label attributes,
+// named with prefix, for dirs.
+func setSourceIncludeDirectoryAttrs(setAttr func(string, interface{}), prefix string, dirs map[string][]string, labelPackage string) {
+	for _, entry := range compactIncludeDirectoryAttrs {
+		paths := dirs[entry.attr]
+		if len(paths) == 0 {
+			continue
+		}
+		labels := make([]string, 0, len(paths))
+		for _, path := range paths {
+			labels = append(labels, labelFor(labelPackage, path))
+		}
+		setAttr(prefix+entry.attr, labels)
+	}
+}
+
+func isIncludeDirectoryOption(flag string) bool {
+	switch flag {
+	case "-I", "-iquote", "-isystem", "-idirafter":
+		return true
+	}
+	return false
+}
+
+// treeRootedIncludeDirectory roots a relative include directory at
+// $(srctree). Kbuild runs the compiler from the top of the tree, so a
+// directory such as the expansion of `-iquote $(obj)` names a tree path, and
+// the source scan resolves it that way. Rules resolve $(srctree) from the
+// source tree they receive by label.
+func treeRootedIncludeDirectory(path string) string {
+	if path == "" || strings.HasPrefix(path, "/") || strings.Contains(path, "$(") || strings.Contains(path, "${") {
+		return path
+	}
+	path = normalizeCompactPath(path)
+	if path == "." {
+		return "$(srctree)"
+	}
+	return "$(srctree)/" + path
+}
+
 func normalizeSourceRootFlag(flag, sourceRoot string) string {
-	for _, prefix := range []string{"-I", "-iquote", "-isystem", "-include"} {
+	for _, prefix := range []string{"-idirafter", "-I", "-iquote", "-isystem", "-include"} {
 		path := strings.TrimPrefix(flag, prefix)
 		if path == flag {
 			continue
@@ -2606,6 +2773,9 @@ func normalizeSourceRootFlag(flag, sourceRoot string) string {
 		}
 		if strings.HasPrefix(path, sourceRoot+"/") {
 			return prefix + "$(srctree)/" + strings.TrimPrefix(path, sourceRoot+"/")
+		}
+		if prefix != "-include" {
+			return prefix + treeRootedIncludeDirectory(path)
 		}
 		return prefix + path
 	}
@@ -2930,6 +3100,8 @@ var compactGroupedSpecialObjects = map[string]bool{
 	"arch/powerpc/kernel/vdso64_wrapper.o":        true,
 	"arch/powerpc/kernel/vdso32_wrapper.o":        true,
 	"arch/x86/entry/vdso/vdso-image-64.o":         true,
+	x86VDSO64ImageObject:                          true,
+	x86VDSO32ImageObject:                          true,
 	"arch/x86/kernel/cpu/capflags.o":              true,
 	"arch/x86/lib/inat.o":                         true,
 	"arch/x86/purgatory/kexec-purgatory.o":        true,
@@ -3367,9 +3539,11 @@ func (m *CompactMetadata) objectBuildFile(opts CompactBuildFileOptions) ([]byte,
 			}
 			r.SetAttr("genksyms", opts.SourceGenksyms)
 			r.SetAttr("symversions", true)
-			if len(variant.SymversionFlags) != 0 {
-				r.SetAttr("symversion_flags", variant.SymversionFlags)
+			symversionFlags, symversionDirs := splitSourceTreeIncludeDirectories(variant.SymversionFlags, opts.SourceRoot)
+			if len(symversionFlags) != 0 {
+				r.SetAttr("symversion_flags", symversionFlags)
 			}
+			setSourceIncludeDirectoryAttrs(r.SetAttr, "symversion_", symversionDirs, opts.SourceLabelPackage)
 			if len(variant.SymversionRemoveFlags) != 0 {
 				r.SetAttr("symversion_remove_flags", variant.SymversionRemoveFlags)
 			}
@@ -3389,9 +3563,11 @@ func (m *CompactMetadata) objectBuildFile(opts CompactBuildFileOptions) ([]byte,
 		if variant.ModuleRoot {
 			r.SetAttr("module_root", true)
 		}
-		if len(variant.Flags) != 0 {
-			r.SetAttr("flags", variant.Flags)
+		flags, includeDirs := splitSourceTreeIncludeDirectories(variant.Flags, opts.SourceRoot)
+		if len(flags) != 0 {
+			r.SetAttr("flags", flags)
 		}
+		setSourceIncludeDirectoryAttrs(r.SetAttr, "", includeDirs, opts.SourceLabelPackage)
 		if len(variant.RemoveFlags) != 0 {
 			r.SetAttr("remove_flags", variant.RemoveFlags)
 		}
@@ -3432,7 +3608,9 @@ func (m *CompactMetadata) objectBuildFile(opts CompactBuildFileOptions) ([]byte,
 				r.SetAttr("objects", objects)
 				r.SetAttr("mode", first.Mode)
 				r.SetAttr("language", compactSourceLanguage(first.Source))
-				r.SetAttr("flags", first.Flags)
+				groupFlags, groupIncludeDirs := splitSourceTreeIncludeDirectories(first.Flags, opts.SourceRoot)
+				r.SetAttr("flags", groupFlags)
+				setSourceIncludeDirectoryAttrs(r.SetAttr, "", groupIncludeDirs, opts.SourceLabelPackage)
 				r.SetAttr("recipe_id", emission.Group.RecipeID)
 				r.SetAttr("reachability_id", reachabilityID)
 				r.SetAttr("reachable_configs", emission.Group.ReachableConfigs)
@@ -3460,9 +3638,11 @@ func (m *CompactMetadata) objectBuildFile(opts CompactBuildFileOptions) ([]byte,
 					}
 					r.SetAttr("genksyms", opts.SourceGenksyms)
 					r.SetAttr("symversions", true)
-					if len(first.SymversionFlags) != 0 {
-						r.SetAttr("symversion_flags", first.SymversionFlags)
+					symversionFlags, symversionDirs := splitSourceTreeIncludeDirectories(first.SymversionFlags, opts.SourceRoot)
+					if len(symversionFlags) != 0 {
+						r.SetAttr("symversion_flags", symversionFlags)
 					}
+					setSourceIncludeDirectoryAttrs(r.SetAttr, "symversion_", symversionDirs, opts.SourceLabelPackage)
 					if len(first.SymversionRemoveFlags) != 0 {
 						r.SetAttr("symversion_remove_flags", first.SymversionRemoveFlags)
 					}

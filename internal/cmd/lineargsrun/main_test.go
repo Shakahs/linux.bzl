@@ -28,6 +28,7 @@ func TestReadAndExpandLineArgs(t *testing.T) {
 	}
 	got, err := expandedArgs(
 		[]string{"input.h", "{args_file}", "-o", "{output}"},
+		path,
 		fileArgs,
 		"output.rs",
 	)
@@ -55,7 +56,7 @@ func TestParseArgs(t *testing.T) {
 }
 
 func TestExpandedArgsRequiresPlaceholder(t *testing.T) {
-	_, err := expandedArgs([]string{"input.h"}, nil, "output.rs")
+	_, err := expandedArgs([]string{"input.h"}, "params", nil, "output.rs")
 	if err == nil || !strings.Contains(err.Error(), "{args_file}") {
 		t.Fatalf("expandedArgs() error = %v, want placeholder error", err)
 	}

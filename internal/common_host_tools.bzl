@@ -108,7 +108,10 @@ def linux_common_host_tools(
 
     cc_binary(
         name = sorttable_tool,
-        srcs = [source_label(source_repo, "scripts/sorttable.c")],
+        srcs = [
+            source_label(source_repo, "scripts/sorttable.c"),
+            source_label(source_repo, "sorttable_elf_parse_srcs"),
+        ],
         visibility = visibility,
         deps = [
             Label("@elfutils//:elf"),

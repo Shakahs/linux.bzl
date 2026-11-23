@@ -2,8 +2,7 @@
 
 load(":architecture_profiles.bzl", "linux_architecture_profile", "linux_architecture_profiles")
 load(":config_validation.bzl", "validate_config_features")
-load(":kconfig_tool_filename.bzl", "kconfig_tool_filename")
-load(":kconfig_tool_releases.bzl", "KCONFIG_TOOL_RELEASES", "KCONFIG_TOOL_VERSION")
+load(":kconfig_generator_sources.bzl", "watch_kconfig_generator_sources")
 load(
     ":repository_utils.bzl",
     _SOURCE_REPOSITORY_PROTOCOL = "LINUX_SOURCE_REPOSITORY_PROTOCOL",
@@ -347,7 +346,7 @@ def _linux_image_impl(rctx):
     base_input = _read_config(rctx, rctx.attr.config, "base config")
     _validate_fragment_arch(arch, base_input, "base config")
     validate_config_features(base_input, "base config")
-    tool = _download_generator(rctx)
+    tool = _source_generator(rctx)
     base = _resolve_config(
         rctx = rctx,
         tool = tool,
@@ -534,7 +533,7 @@ def _linux_image_impl(rctx):
             "rust_enabled": base_rust_enabled,
             "rust_profile_schema": "linux-rust-profile-v2" if rust_profile_json else "",
             "minimum_rustc_version": minimum_rustc_version,
-            "tool_version": KCONFIG_TOOL_VERSION,
+            "tool_version": "source",
             "variant_rust_enabled": variant_rust_enabled,
             "version": version,
         }) + "\n",
@@ -575,6 +574,11 @@ linux_image = repository_rule(
         "target_triple": attr.string(
             default = "x86_64-linux-gnu",
             doc = "Canonical LLVM target triple bound to target_profile. Defaults to x86_64-linux-gnu for legacy direct callers.",
+        ),
+        "generator": attr.label(
+            allow_single_file = True,
+            mandatory = True,
+            doc = "Kconfig graph generator built from linux.bzl's sources by kconfig_generator.",
         ),
         "probe_cc": attr.label(
             allow_single_file = True,
@@ -827,44 +831,13 @@ def _initialize_generator_outputs(rctx, graph_dir):
     rctx.file(graph_dir + "/BUILD.bazel", "", executable = False)
     rctx.file(graph_dir + "/metadata.json", "{}\n", executable = False)
 
-def _host_platform(rctx):
-    os_name = rctx.os.name.lower()
-    if os_name.startswith("linux"):
-        os = "linux"
-    elif os_name.startswith("mac os"):
-        os = "darwin"
-    elif "windows" in os_name:
-        os = "windows"
-    else:
-        fail("no linux.bzl graph generator for host operating system %r" % rctx.os.name)
-
-    arch = {
-        "aarch64": "arm64",
-        "amd64": "amd64",
-        "arm64": "arm64",
-        "x86_64": "amd64",
-    }.get(rctx.os.arch.lower())
-    if arch == None:
-        fail("no linux.bzl graph generator for host architecture %r" % rctx.os.arch)
-    return "%s_%s" % (os, arch)
-
-def _download_generator(rctx):
-    platform = _host_platform(rctx)
-    release = KCONFIG_TOOL_RELEASES.get(platform)
-    if release == None or not release.integrity:
-        fail(
-            "no integrity-pinned linux.bzl graph generator for host platform %s at %s" %
-            (platform, KCONFIG_TOOL_VERSION),
-        )
-    rctx.download_and_extract(
-        url = release.urls,
-        integrity = release.integrity,
-        output = ".linux_bzl_tools",
-        canonical_id = "linux.bzl-generator-%s-%s" % (KCONFIG_TOOL_VERSION, platform),
-    )
-    tool = rctx.path(".linux_bzl_tools").get_child(kconfig_tool_filename(platform, "kconfig_parse"))
+def _source_generator(rctx):
+    # Built from this module's sources by the kconfig_generator repository.
+    # Watching those sources regenerates the graph when the generator changes.
+    watch_kconfig_generator_sources(rctx)
+    tool = rctx.path(rctx.attr.generator)
     if not tool.exists:
-        fail("linux.bzl generator archive for %s does not contain kconfig_parse" % platform)
+        fail("linux.bzl Kconfig graph generator %s does not exist" % tool)
     return tool
 
 def _generate_rust_profile(rctx, tool, source_root, descriptor):

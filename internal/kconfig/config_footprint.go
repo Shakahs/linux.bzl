@@ -110,6 +110,7 @@ const (
 	sourceScanRISCVCompatVDSO sourceScanProfile = "riscv-compat-vdso"
 	sourceScanPPC64VDSO       sourceScanProfile = "ppc64-vdso"
 	sourceScanPPC32VDSO       sourceScanProfile = "ppc32-vdso"
+	sourceScanX86VDSO32       sourceScanProfile = "x86-vdso32"
 )
 
 var sourceConfigPredefinedSymbols = []struct {
@@ -643,7 +644,21 @@ func (s *configSourceScanner) closureForSourceConfigInputsSearchProfile(
 				if modeledRecursiveTemplateInclude(treePath, inc.spelling) {
 					continue
 				}
-				err := fmt.Errorf(
+				formatHeader, modeled, err := s.genericPTTemplateInclude(source, treePath, inc.spelling)
+				if err != nil {
+					err = fmt.Errorf("%s:%d: %w", treePath, inc.line, err)
+					s.closure[key] = sourceClosure{}
+					s.closureErrs[key] = err
+					return sourceClosure{}, err
+				}
+				if modeled {
+					child := sourceClosureStackEntry{treePath: formatHeader}
+					if !visited[child] {
+						stack = append(stack, child)
+					}
+					continue
+				}
+				err = fmt.Errorf(
 					"%s:%d: unresolved potentially-active nonliteral include %s",
 					treePath,
 					inc.line,
@@ -1588,6 +1603,27 @@ func sourceProfilePredefinedSymbols(profile sourceScanProfile) map[string]bool {
 			"__powerpc__":              true,
 			"__powerpc64__":            false,
 		}
+	case sourceScanX86VDSO32:
+		// Linux 7.x compiles the 32-bit vDSO of a 64-bit kernel with -m32
+		// and -include fake_32bit_build.h, which replaces these symbols.
+		return map[string]bool{
+			"__x86_64__":                           false,
+			"__amd64__":                            false,
+			"__i386__":                             true,
+			"__ILP32__":                            true,
+			"BUILD_VDSO":                           true,
+			"BUILD_VDSO32":                         true,
+			"BUILD_VDSO32_64":                      true,
+			"DISABLE_BRANCH_PROFILING":             true,
+			"__DISABLE_EXPORTS":                    true,
+			"CONFIG_64BIT":                         false,
+			"CONFIG_X86_64":                        false,
+			"CONFIG_X86_32":                        true,
+			"CONFIG_COMPAT":                        false,
+			"CONFIG_SPARSEMEM_VMEMMAP":             false,
+			"CONFIG_HUGETLB_PAGE_OPTIMIZE_VMEMMAP": false,
+			"CONFIG_PARAVIRT_XXL":                  false,
+		}
 	default:
 		return nil
 	}
@@ -1611,6 +1647,52 @@ func configIncludePath(operand string, config *ResolvedConfig) (string, bool) {
 		return "", false
 	}
 	return filepath.ToSlash(path), true
+}
+
+const genericPTTemplate = "drivers/iommu/generic_pt/fmt/iommu_template.h"
+
+// genericPTTemplateInclude resolves the computed includes of Linux 7.x's
+// generic IOMMU page-table template. Each format source defines PT_FMT before
+// it includes the template, which includes PT_DEFS_H, the stringified
+// defs_<PT_FMT>.h, and PT_FMT_H, the stringified <PT_FMT>.h, from its own
+// directory. The second result reports whether the include is modeled.
+func (s *configSourceScanner) genericPTTemplateInclude(source, treePath, operand string) (string, bool, error) {
+	if treePath != genericPTTemplate {
+		return "", false, nil
+	}
+	var format string
+	switch strings.TrimSpace(operand) {
+	case "PT_DEFS_H":
+		format = "defs_%s.h"
+	case "PT_FMT_H":
+		format = "%s.h"
+	default:
+		return "", false, nil
+	}
+	abs, ok := s.absForTreePath(source)
+	if !ok {
+		return "", true, fmt.Errorf("generic page-table source %s does not exist", source)
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return "", true, err
+	}
+	var name string
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(strings.Replace(strings.TrimSpace(line), "#", "# ", 1))
+		if len(fields) == 4 && fields[0] == "#" && fields[1] == "define" && fields[2] == "PT_FMT" {
+			name = fields[3]
+			break
+		}
+	}
+	if name == "" || !sourceIdentifier(name) {
+		return "", true, fmt.Errorf("generic page-table source %s does not define PT_FMT", source)
+	}
+	header := filepath.ToSlash(filepath.Join(filepath.Dir(genericPTTemplate), fmt.Sprintf(format, name)))
+	if _, ok := s.absForTreePath(header); !ok {
+		return "", true, fmt.Errorf("generic page-table format header %s does not exist", header)
+	}
+	return header, true, nil
 }
 
 func modeledRecursiveTemplateInclude(treePath, operand string) bool {

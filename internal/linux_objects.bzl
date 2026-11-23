@@ -16,6 +16,7 @@ load(
     "path_mapped_run",
 )
 load(":providers.bzl", "LinuxRustSdkInfo", "LinuxVmlinuxInfo")
+load(":source_include_directories.bzl", "source_include_directory_attrs", "source_include_directory_flags")
 
 visibility("public")
 
@@ -1227,6 +1228,15 @@ def _source_tree_file(ctx, relpath):
             return file
     fail("source tree input %s required by %s was not found" % (relpath, ctx.label))
 
+def _source_tree_has_file(ctx, relpath):
+    if _linux_source_input_file_for_path(ctx, relpath) != None:
+        return True
+    suffix = "/" + relpath
+    for file in _linux_source_tree_files(ctx):
+        if file.short_path == relpath or file.short_path.endswith(suffix):
+            return True
+    return False
+
 def _source_tree_file_for_root(ctx, source_root, relpath):
     indexed = _linux_source_input_file_for_path(ctx, relpath)
     if indexed != None:
@@ -1642,8 +1652,8 @@ def _linux_realmode_compile(ctx, compiler, cc_toolchain, config, generated_heade
     assembly = _is_assembly_source(src)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, _cc_feature_configuration(ctx, cc_toolchain)))
+    args.add_all(_cc_flags_dialect(config))
     args.add_all([
-        "-std=gnu11",
         "-m16",
         "-g",
         "-Os",
@@ -1851,17 +1861,112 @@ def _linux_realmode_outputs(ctx, compiler, linker, cc_toolchain, config, generat
     )
     return struct(bin = bin, relocs = relocs)
 
-def _linux_vdso_compile(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, src, out_relpath):
+_X86_VDSO_6X_IMAGE = "arch/x86/entry/vdso/vdso-image-64.o"
+_X86_VDSO64_IMAGE = "arch/x86/entry/vdso/vdso64/vdso64-image.o"
+_X86_VDSO32_IMAGE = "arch/x86/entry/vdso/vdso32/vdso32-image.o"
+_X86_VDSO64_LINK_FLAGS = [
+    "-Wl,-m,elf_x86_64",
+    "-Wl,-soname,linux-vdso.so.1",
+    "-Wl,-z,max-page-size=4096",
+]
+
+def _config_string_words(value):
+    if len(value) >= 2 and value.startswith("\"") and value.endswith("\""):
+        value = value[1:-1]
+    return [word for word in value.split(" ") if word]
+
+def _cc_flags_dialect(config):
+    """Returns Kbuild's CC_FLAGS_DIALECT for config.
+
+    Linux 7.x adds the Kconfig-selected option that lets a struct embed a tagged
+    struct anonymously, and the Clang warnings it disables for that extension.
+    Earlier kernels have no CONFIG_CC_MS_EXTENSIONS and use plain GNU C11.
+    """
+    flags = ["-std=gnu11"]
+    ms_extensions = config.config_flags.get("CONFIG_CC_MS_EXTENSIONS", "")
+    if ms_extensions:
+        flags.extend(_config_string_words(ms_extensions))
+        if config.config_flags.get("CONFIG_CC_IS_CLANG") == "y":
+            flags.extend(["-Wno-gnu", "-Wno-microsoft-anon-tag"])
+    return flags
+
+def _x86_vdso_spec(object, config):
+    """Describes the x86 vDSO image that object embeds, or returns None.
+
+    Linux 6.x builds one 64-bit image in arch/x86/entry/vdso. Linux 7.x builds
+    each image in its own directory from arch/x86/entry/vdso/common/
+    Makefile.include, which this mirrors.
+    """
+    if object == _X86_VDSO_6X_IMAGE:
+        return struct(
+            directory = "arch/x86/entry/vdso",
+            sources = ["vdso-note.S", "vclock_gettime.c", "vgetcpu.c", "vgetrandom.c", "vgetrandom-chacha.S"],
+            linker_script = "vdso.lds.S",
+            library = "vdso64",
+            image_source = "vdso-image-64.c",
+            compile_flags = ["-mcmodel=small", "-m64"],
+            preincludes = [],
+            include_dirs = ["arch/x86/entry/vdso"],
+            linker_script_flags = [],
+            link_flags = _X86_VDSO64_LINK_FLAGS,
+        )
+    if object not in [_X86_VDSO64_IMAGE, _X86_VDSO32_IMAGE]:
+        return None
+    config_flags = config.config_flags if config else {}
+    common_flags = ["-D__DISABLE_EXPORTS", "-fcf-protection=none"]
+    sources = ["note.S", "vclock_gettime.c", "vgetcpu.c"]
+    if object == _X86_VDSO64_IMAGE:
+        sources.extend(["vgetrandom.c", "vgetrandom-chacha.S"])
+        if config_flags.get("CONFIG_X86_SGX") == "y":
+            sources.append("vsgx.S")
+        if config_flags.get("CONFIG_FUTEX_ROBUST_UNLOCK") == "y":
+            sources.append("vfutex.c")
+        return struct(
+            directory = "arch/x86/entry/vdso/vdso64",
+            sources = sources,
+            linker_script = "vdso64.lds.S",
+            library = "vdso64",
+            image_source = "vdso64-image.c",
+            compile_flags = ["-DBUILD_VDSO64", "-m64", "-mcmodel=small"] +
+                            _config_string_words(config_flags.get("CONFIG_CC_OPT_INLINE_MEMSET", "")) +
+                            common_flags,
+            preincludes = [],
+            include_dirs = ["arch/x86/entry/vdso", ""],
+            linker_script_flags = ["-C"],
+            link_flags = _X86_VDSO64_LINK_FLAGS,
+        )
+    sources.extend(["system_call.S", "sigreturn.S"])
+    if config_flags.get("CONFIG_FUTEX_ROBUST_UNLOCK") == "y":
+        sources.append("vfutex.c")
+    return struct(
+        directory = "arch/x86/entry/vdso/vdso32",
+        sources = sources,
+        linker_script = "vdso32.lds.S",
+        library = "vdso32",
+        image_source = "vdso32-image.c",
+        compile_flags = ["-DBUILD_VDSO32", "-m32", "-mregparm=0"] + common_flags,
+        # fake_32bit_build.h must follow kconfig.h so its #undefs take effect.
+        preincludes = ["arch/x86/entry/vdso/vdso32/fake_32bit_build.h"],
+        include_dirs = ["arch/x86/entry/vdso", ""],
+        linker_script_flags = ["-C"],
+        link_flags = ["-m32", "-Wl,-m,elf_i386", "-Wl,-soname,linux-gate.so.1"],
+    )
+
+def _x86_vdso_include_flags(source_root, spec):
+    return [
+        "-I" + source_root + ("/" + directory if directory else "")
+        for directory in spec.include_dirs
+    ]
+
+def _linux_vdso_compile(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, spec, src, out_relpath):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/" + out_relpath)
     assembly = _is_assembly_source(src)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
     args.add_all([
-        "-mcmodel=small",
         "-fPIC",
         "-O2",
         "-fasynchronous-unwind-tables",
-        "-m64",
         "-fno-stack-protector",
         "-fno-omit-frame-pointer",
         "-foptimize-sibling-calls",
@@ -1869,10 +1974,13 @@ def _linux_vdso_compile(ctx, compiler, cc_toolchain, feature_configuration, conf
         "-DBUILD_VDSO",
         "-Wno-unused-command-line-argument",
     ])
+    args.add_all(spec.compile_flags)
     args.add_all(_linux_source_preinclude_flags_for_root(source_root, assembly))
+    for preinclude in spec.preincludes:
+        args.add_all(["-include", source_root + "/" + preinclude])
     if config:
         _add_config_include_flag(args, config)
-    args.add("-I" + source_root + "/arch/x86/entry/vdso")
+    args.add_all(_x86_vdso_include_flags(source_root, spec))
     _add_linux_source_include_flags(ctx, args, generated_headers)
     args.add("-c")
     args.add(src)
@@ -1896,9 +2004,11 @@ def _linux_vdso_compile(ctx, compiler, cc_toolchain, feature_configuration, conf
     )
     return out
 
-def _linux_vdso_linker_script(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root):
-    src = _source_tree_file(ctx, "arch/x86/entry/vdso/vdso.lds.S")
-    out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/entry/vdso/vdso.lds")
+def _linux_vdso_linker_script(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, spec):
+    src = _source_tree_file(ctx, spec.directory + "/" + spec.linker_script)
+    out = ctx.actions.declare_file(
+        ctx.label.name + ".obj/" + spec.directory + "/" + spec.linker_script.removesuffix(".S"),
+    )
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
     args.add_all(_linux_config_cflags(config), format_each = "@%s")
@@ -1914,9 +2024,10 @@ def _linux_vdso_linker_script(ctx, compiler, cc_toolchain, feature_configuration
         "-include",
         source_root + "/include/linux/kconfig.h",
     ])
+    args.add_all(spec.linker_script_flags)
     if config:
         _add_config_include_flag(args, config)
-    args.add("-I" + source_root + "/arch/x86/entry/vdso")
+    args.add_all(_x86_vdso_include_flags(source_root, spec))
     _add_linux_source_include_flags(ctx, args, generated_headers)
     args.add(src)
     args.add("-o")
@@ -1942,8 +2053,8 @@ def _linux_vdso_linker_script(ctx, compiler, cc_toolchain, feature_configuration
     )
     return out
 
-def _linux_vdso_link(ctx, linker, cc_toolchain, objects, linker_script):
-    out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/entry/vdso/vdso64.so.dbg")
+def _linux_vdso_link(ctx, linker, cc_toolchain, spec, objects, linker_script):
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/" + spec.directory + "/" + spec.library + ".so.dbg")
     args = ctx.actions.args()
     args.add("-fuse-ld=lld")
     args.add("-nostdlib")
@@ -1954,9 +2065,7 @@ def _linux_vdso_link(ctx, linker, cc_toolchain, objects, linker_script):
     args.add("-Wl,--eh-frame-hdr")
     args.add("-Wl,-Bsymbolic")
     args.add("-Wl,-z,noexecstack")
-    args.add("-Wl,-m,elf_x86_64")
-    args.add("-Wl,-soname,linux-vdso.so.1")
-    args.add("-Wl,-z,max-page-size=4096")
+    args.add_all(spec.link_flags)
     args.add(linker_script, format = "-Wl,-T,%s")
     args.add("-o")
     args.add(out)
@@ -1972,16 +2081,10 @@ def _linux_vdso_link(ctx, linker, cc_toolchain, objects, linker_script):
     )
     return out
 
-def _linux_vdso_image_source(ctx, compiler, linker, cc_toolchain, feature_configuration, config, generated_headers, source_root):
-    source_specs = [
-        ("arch/x86/entry/vdso/vdso-note.S", "arch/x86/entry/vdso/vdso-note.o"),
-        ("arch/x86/entry/vdso/vclock_gettime.c", "arch/x86/entry/vdso/vclock_gettime.o"),
-        ("arch/x86/entry/vdso/vgetcpu.c", "arch/x86/entry/vdso/vgetcpu.o"),
-        ("arch/x86/entry/vdso/vgetrandom.c", "arch/x86/entry/vdso/vgetrandom.o"),
-        ("arch/x86/entry/vdso/vgetrandom-chacha.S", "arch/x86/entry/vdso/vgetrandom-chacha.o"),
-    ]
+def _linux_vdso_image_source(ctx, compiler, linker, cc_toolchain, feature_configuration, config, generated_headers, source_root, spec):
     objects = []
-    for src_relpath, out_relpath in source_specs:
+    for source in spec.sources:
+        stem = source.rsplit(".", 1)[0]
         objects.append(_linux_vdso_compile(
             ctx,
             compiler,
@@ -1990,13 +2093,14 @@ def _linux_vdso_image_source(ctx, compiler, linker, cc_toolchain, feature_config
             config,
             generated_headers,
             source_root,
-            _source_tree_file(ctx, src_relpath),
-            out_relpath,
+            spec,
+            _source_tree_file(ctx, spec.directory + "/" + source),
+            spec.directory + "/" + stem + ".o",
         ))
-    linker_script = _linux_vdso_linker_script(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root)
-    dbg = _linux_vdso_link(ctx, linker, cc_toolchain, objects, linker_script)
+    linker_script = _linux_vdso_linker_script(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, spec)
+    dbg = _linux_vdso_link(ctx, linker, cc_toolchain, spec, objects, linker_script)
 
-    stripped = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/entry/vdso/vdso64.so")
+    stripped = ctx.actions.declare_file(ctx.label.name + ".obj/" + spec.directory + "/" + spec.library + ".so")
     objcopy_args = ctx.actions.args()
     objcopy_args.add("-S")
     objcopy_args.add("--remove-section")
@@ -2013,7 +2117,7 @@ def _linux_vdso_image_source(ctx, compiler, linker, cc_toolchain, feature_config
         progress_message = "Stripping Linux x86 vDSO %{label}",
     )
 
-    out = ctx.actions.declare_file(ctx.label.name + ".obj/arch/x86/entry/vdso/vdso-image-64.c")
+    out = ctx.actions.declare_file(ctx.label.name + ".obj/" + spec.directory + "/" + spec.image_source)
     vdso2c_args = ctx.actions.args()
     vdso2c_args.add("-raw", dbg)
     vdso2c_args.add("-stripped", stripped)
@@ -2371,10 +2475,16 @@ def _linux_module_flags(mode):
         return ["-DMODULE"]
     return []
 
+# Headers that x86 takes from asm-generic in some supported release, through
+# generic-y in arch/x86/include/asm/Kbuild or mandatory-y in
+# include/asm-generic/Kbuild. _x86_asm_generic_wrappers selects those the
+# source tree needs.
 _X86_ASM_GENERIC_WRAPPERS = [
+    "device.h",
     "early_ioremap.h",
     "fprobe.h",
     "irq_regs.h",
+    "kexec_handover.h",
     "kmap_size.h",
     "local64.h",
     "mcs_spinlock.h",
@@ -2385,6 +2495,29 @@ _X86_ASM_GENERIC_WRAPPERS = [
     "rwonce.h",
     "unwind_user.h",
 ]
+
+def _x86_asm_generic_wrappers(ctx):
+    """Returns the asm-generic wrappers Kbuild generates for x86's source tree.
+
+    Kbuild wraps an asm-generic header only when the architecture has no
+    header of its own: Linux 7.x drops x86's asm/device.h and adds its own
+    asm/unwind_user.h, for example.
+    """
+    arch_headers = {}
+    generic_headers = {}
+    for file in _linux_source_tree_files(ctx):
+        path = file.short_path
+        if path.startswith("../"):
+            path = path.split("/", 2)[2]
+        if path.startswith("arch/x86/include/asm/"):
+            arch_headers[path[len("arch/x86/include/asm/"):]] = True
+        elif path.startswith("include/asm-generic/"):
+            generic_headers[path[len("include/asm-generic/"):]] = True
+    return [
+        header
+        for header in _X86_ASM_GENERIC_WRAPPERS
+        if header in generic_headers and header not in arch_headers
+    ]
 
 _X86_UAPI_ASM_GENERIC_WRAPPERS = [
     "auxvec.h",
@@ -2768,7 +2901,9 @@ def _linux_arm64_vdso32_compile(ctx, cc_toolchain, feature_configuration, config
         "-fno-common",
         "-Werror-implicit-function-declaration",
         "-Wno-format-security",
-        "-std=gnu11",
+    ])
+    args.add_all(_cc_flags_dialect(config))
+    args.add_all([
         "-O2",
         "-Wno-pointer-sign",
         "-Wno-default-const-init-unsafe",
@@ -3059,7 +3194,7 @@ def _linux_x86_static_header_family(ctx):
     headers = []
     arch_include_dir = None
     uapi_include_dir = None
-    for header in _X86_ASM_GENERIC_WRAPPERS:
+    for header in _x86_asm_generic_wrappers(ctx):
         out = ctx.actions.declare_file(base + "/arch/x86/include/generated/asm/" + header)
         ctx.actions.write(
             output = out,
@@ -5766,12 +5901,22 @@ def _resolve_linux_config(ctx, rust_toolchain_probe):
         args.add("-rust_toolchain_probe", rust_toolchain_probe)
         args.add("-validate_config_equivalence")
     _add_linux_probe_args(args, ctx.attr.allow_shell, vars, env)
+    probe_tools = []
+    if ctx.attr.target_profile:
+        # Measure Kconfig's compiler probes with the LLVM tools the compile
+        # actions run, as the repository rule did when it generated the graph.
+        args.add("-target_profile", ctx.attr.target_profile)
+        args.add("-linux_arch", ctx.attr.linux_arch)
+        args.add("-target_triple", ctx.attr.target_triple)
+        args.add("-probe_cc", ctx.file._probe_cc)
+        args.add("-probe_ld", ctx.file._probe_ld)
+        probe_tools = [ctx.file._probe_cc, ctx.file._probe_ld]
     for key, value in sorted(vars.items()):
         args.add("-var", "%s=%s" % (key, value))
     for key, value in sorted(env.items()):
         args.add("-env", "%s=%s" % (key, value))
 
-    inputs = [ctx.file.root, fragment] + ctx.files.srcs + extra_kconfig_inputs
+    inputs = [ctx.file.root, fragment] + ctx.files.srcs + extra_kconfig_inputs + probe_tools
     if rust_toolchain_probe:
         inputs.append(rust_toolchain_probe)
     if ctx.file.source_root:
@@ -5875,10 +6020,29 @@ _LINUX_RESOLVED_CONFIG_ATTRS = {
         allow_files = True,
         doc = "Additional Kconfig source files read through source statements.",
     ),
+    "linux_arch": attr.string(
+        doc = "Linux ARCH of target_profile.",
+    ),
+    "target_profile": attr.string(
+        doc = "Linux target profile name. When set, the resolver measures compiler probes with the exec-platform LLVM tools.",
+    ),
+    "target_triple": attr.string(
+        doc = "LLVM target triple of target_profile.",
+    ),
     "vars": attr.string_dict(
         doc = "Kconfig preprocessor variables.",
     ),
     "version": attr.string(default = "6.18.2"),
+    "_probe_cc": attr.label(
+        allow_single_file = True,
+        cfg = "exec",
+        default = Label("@llvm//tools:clang"),
+    ),
+    "_probe_ld": attr.label(
+        allow_single_file = True,
+        cfg = "exec",
+        default = Label("@llvm//tools:ld.lld"),
+    ),
     "_kconfig_parse": attr.label(
         cfg = "exec",
         default = Label("//internal/cmd/kconfig_parse:kconfig_parse"),
@@ -6225,7 +6389,8 @@ def _linux_object_impl(ctx):
         )
         src = generated
         generated_sources.append(generated)
-    if ctx.attr.object == "arch/x86/entry/vdso/vdso-image-64.o":
+    vdso_spec = _x86_vdso_spec(ctx.attr.object, config)
+    if vdso_spec != None:
         generated = _linux_vdso_image_source(
             ctx,
             compiler,
@@ -6235,6 +6400,7 @@ def _linux_object_impl(ctx):
             config,
             generated_headers,
             source_root,
+            vdso_spec,
         )
         src = generated
         generated_sources.append(generated)
@@ -6379,6 +6545,7 @@ def _linux_object_impl(ctx):
     expanded_flags = _remove_exact_flags(expanded_flags, expanded_remove_flags)
     if utsversion_tmp != None:
         expanded_flags = _rewrite_utsversion_tmp_flags(expanded_flags, ctx.attr.object, utsversion_tmp)
+    args.add_all(source_include_directory_flags(ctx))
     args.add_all(expanded_flags)
     if source_version_depfile != None:
         args.add("-MD")
@@ -6522,6 +6689,7 @@ def _linux_object_impl(ctx):
             symversion_args.add("-I" + source_root + "/arch/powerpc")
         for include in ctx.attr.include_dirs:
             symversion_args.add("-I" + include)
+        symversion_args.add_all(source_include_directory_flags(ctx, "symversion_"))
         symversion_args.add_all(expanded_symversion_flags)
         symversion_args.add_all(["-E", "-D__GENKSYMS__"])
         mode = "asm" if _is_assembly_source(src) else "c"
@@ -6588,7 +6756,7 @@ def _linux_object_impl(ctx):
             "source=%s" % source_file.short_path,
             "object=%s" % ctx.attr.object,
             "output=%s" % out.short_path,
-        ] + ["flag=%s" % flag for flag in ctx.attr.flags] + ["remove_flag=%s" % flag for flag in ctx.attr.remove_flags]) + "\n",
+        ] + ["flag=%s" % flag for flag in source_include_directory_flags(ctx) + ctx.attr.flags] + ["remove_flag=%s" % flag for flag in ctx.attr.remove_flags]) + "\n",
     )
 
     info = LinuxObjectInfo(
@@ -6779,7 +6947,7 @@ linux_object = rule(
             default = Label("//internal/cmd/vdso2c"),
             executable = True,
         ),
-    },
+    } | source_include_directory_attrs() | source_include_directory_attrs("symversion_"),
     fragments = ["cpp"],
     toolchains = use_cc_toolchain() + [_PERL_TOOLCHAIN],
     doc = "Compiles one content-addressed, source-backed Linux object variant.",
@@ -8620,7 +8788,9 @@ def _linux_x86_compressed_compile(ctx, compiler, cc_toolchain, feature_configura
     args.add_all([
         "-m64",
         "-O2",
-        "-std=gnu11",
+    ])
+    args.add_all(_cc_flags_dialect(config))
+    args.add_all([
         "-fno-strict-aliasing",
         "-fPIE",
         "-Wundef",
@@ -8712,7 +8882,9 @@ def _linux_x86_efi_stub_compile(ctx, compiler, cc_toolchain, feature_configurati
     args.add_all([
         "-m64",
         "-D__KERNEL__",
-        "-std=gnu11",
+    ])
+    args.add_all(_cc_flags_dialect(config))
+    args.add_all([
         "-fPIC",
         "-fno-strict-aliasing",
         "-mno-red-zone",
@@ -8888,13 +9060,18 @@ def _linux_x86_compressed_vmlinux(ctx, compiler, linker, archiver, cc_toolchain,
             ("lib/cmdline.c", "drivers/firmware/efi/libstub/lib-cmdline.stub.o"),
             ("lib/ctype.c", "drivers/firmware/efi/libstub/lib-ctype.stub.o"),
             ("drivers/firmware/efi/libstub/alignedmem.c", "drivers/firmware/efi/libstub/alignedmem.stub.o"),
-            ("drivers/firmware/efi/libstub/relocate.c", "drivers/firmware/efi/libstub/relocate.stub.o"),
+        ]
+
+        # Linux 7.x removed relocate.c from the stub library.
+        if _source_tree_has_file(ctx, "drivers/firmware/efi/libstub/relocate.c"):
+            efi_stub_specs.append(("drivers/firmware/efi/libstub/relocate.c", "drivers/firmware/efi/libstub/relocate.stub.o"))
+        efi_stub_specs.extend([
             ("drivers/firmware/efi/libstub/printk.c", "drivers/firmware/efi/libstub/printk.stub.o"),
             ("drivers/firmware/efi/libstub/vsprintf.c", "drivers/firmware/efi/libstub/vsprintf.stub.o"),
             ("drivers/firmware/efi/libstub/x86-stub.c", "drivers/firmware/efi/libstub/x86-stub.stub.o"),
             ("drivers/firmware/efi/libstub/smbios.c", "drivers/firmware/efi/libstub/smbios.stub.o"),
             ("drivers/firmware/efi/libstub/x86-5lvl.c", "drivers/firmware/efi/libstub/x86-5lvl.stub.o"),
-        ]
+        ])
         if _linux_x86_config_enabled(config, "CONFIG_UNACCEPTED_MEMORY"):
             efi_stub_specs.extend([
                 ("drivers/firmware/efi/libstub/unaccepted_memory.c", "drivers/firmware/efi/libstub/unaccepted_memory.stub.o"),
@@ -8968,8 +9145,8 @@ def _linux_x86_setup_compile(ctx, compiler, cc_toolchain, feature_configuration,
     assembly = _is_assembly_source(src)
     args = ctx.actions.args()
     args.add_all(_linux_compile_flags(ctx, cc_toolchain, feature_configuration))
+    args.add_all(_cc_flags_dialect(config))
     args.add_all([
-        "-std=gnu11",
         "-m16",
         "-g",
         "-Os",
