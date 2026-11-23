@@ -933,6 +933,8 @@ def _generate_content_graph(
         str(source),
         "-source_asn1_compiler",
         "//:_base_asn1_compiler_tool",
+        "-source_selinux_genheaders",
+        "//:_base_selinux_genheaders_tool",
         "-source_genksyms",
         "//:_base_genksyms_tool",
         "-allow_shell",

@@ -111,9 +111,34 @@ def _add_kernel_include_dirs(args, helpers, kernel, source_root):
         kernel.generated_headers.include_dir_anchors,
     )
 
-def _target_c_flags(ctx, helpers, kernel, target):
+def _config_cflags_without_lto(ctx, config):
+    """Returns config.cflags without Kbuild's CC_FLAGS_LTO, or None without LTO."""
+    if config.config_flags.get("CONFIG_LTO_CLANG") != "y":
+        return None
+    lto_flags = ["-fvisibility=hidden"]
+    if config.config_flags.get("CONFIG_LTO_CLANG_FULL") == "y":
+        lto_flags.append("-flto")
+    else:
+        lto_flags.extend(["-flto=thin", "-fsplit-lto-unit"])
+    out = ctx.actions.declare_file(ctx.label.name + ".module_prep/" + config.cflags.basename + ".nolto.rsp")
+    args = ctx.actions.args()
+    args.add("-in", config.cflags)
+    args.add("-out", out)
+    args.add_all(lto_flags, before_each = "-remove")
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._flagfilter,
+        inputs = [config.cflags],
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxFlagFilter",
+        progress_message = "Filtering Linux LTO compiler flags %{label}",
+    )
+    return out
+
+def _target_c_flags(ctx, helpers, kernel, target, config_cflags = None):
     source_root = _execroot_dir(kernel.source_root)
-    response_files = [kernel.config.cflags]
+    response_files = [config_cflags if config_cflags != None else kernel.config.cflags]
     if kernel.generated_headers.cflags != None:
         response_files.append(kernel.generated_headers.cflags)
     return struct(
@@ -250,8 +275,13 @@ def _devicetable_offsets(ctx, helpers, kernel, target, source_files):
     asm = ctx.actions.declare_file(ctx.label.name + ".module_prep/scripts/mod/devicetable-offsets.s")
     header = ctx.actions.declare_file(ctx.label.name + ".module_prep/scripts/mod/devicetable-offsets.h")
 
+    # Kbuild's cmd_cc_s_c filters CC_FLAGS_LTO, so the compiler writes
+    # assembly that holds the offsets instead of LLVM bitcode.
+    nolto_cflags = _config_cflags_without_lto(ctx, kernel.config)
+    extra_inputs = [] if nolto_cflags == None else [nolto_cflags]
+    c_flags = _target_c_flags(ctx, helpers, kernel, target, config_cflags = nolto_cflags)
     compile_args = ctx.actions.args()
-    _add_target_c_flags(compile_args, _target_c_flags(ctx, helpers, kernel, target))
+    _add_target_c_flags(compile_args, c_flags)
     compile_args.add("-S")
     compile_args.add(src)
     compile_args.add("-o")
@@ -259,7 +289,7 @@ def _devicetable_offsets(ctx, helpers, kernel, target, source_files):
     path_mapped_run(
         ctx.actions,
         executable = target.compiler,
-        inputs = _target_compile_inputs(kernel, target, [src]),
+        inputs = _target_compile_inputs(kernel, target, [src] + extra_inputs),
         outputs = [asm],
         arguments = [compile_args],
         mnemonic = "LinuxModuleOffsetsAsm",

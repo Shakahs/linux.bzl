@@ -531,9 +531,6 @@ def _unsupported_rust_config_symbols(config, profile = None):
         "CONFIG_RUST_KERNEL_DOCTESTS",
         "CONFIG_TRIM_UNUSED_KSYMS",
         "CONFIG_LD_DEAD_CODE_DATA_ELIMINATION",
-        "CONFIG_LTO_CLANG",
-        "CONFIG_LTO_CLANG_THIN",
-        "CONFIG_LTO_CLANG_FULL",
         "CONFIG_CFI",
         "CONFIG_CFI_CLANG",
         "CONFIG_SHADOW_CALL_STACK",
@@ -589,6 +586,40 @@ def _kernel_c_flags(ctx, config, generated_headers, cc_toolchain, feature_config
         directory_anchors = directory_anchors,
         mapped_files = mapped_files,
         values = values,
+    )
+
+def _kernel_c_flags_without_lto(ctx, config, flags):
+    """Returns flags without CC_FLAGS_LTO, as Kbuild's bindgen_c_flags_lto.
+
+    rustc emits native objects without bitcode, and bindgen parses C rather
+    than compiling it, so neither takes the LTO flags.
+    """
+    if config.config_flags.get("CONFIG_LTO_CLANG") != "y":
+        return flags
+    lto_flags = ["-fvisibility=hidden"]
+    if config.config_flags.get("CONFIG_LTO_CLANG_FULL") == "y":
+        lto_flags.append("-flto")
+    else:
+        lto_flags.extend(["-flto=thin", "-fsplit-lto-unit"])
+    filtered = ctx.actions.declare_file(ctx.label.name + ".rust_sdk/" + config.cflags.basename + ".nolto.rsp")
+    args = ctx.actions.args()
+    args.add("-in", config.cflags)
+    args.add("-out", filtered)
+    args.add_all(lto_flags, before_each = "-remove")
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._flagfilter,
+        inputs = [config.cflags],
+        outputs = [filtered],
+        arguments = [args],
+        mnemonic = "LinuxFlagFilter",
+        progress_message = "Filtering Linux LTO compiler flags for bindgen %{label}",
+    )
+    config_flag = "@" + config.cflags.path
+    return struct(
+        directory_anchors = flags.directory_anchors,
+        mapped_files = [filtered if file == config.cflags else file for file in flags.mapped_files],
+        values = ["@" + filtered.path if value == config_flag else value for value in flags.values],
     )
 
 def _add_kernel_c_flags(args, flags):
@@ -724,7 +755,7 @@ def _run_bindgen_with_parameters(
         ctx.actions,
         executable = ctx.executable._lineargsrun,
         inputs = depset(
-            [header, parameters],
+            [header, parameters] + c_flags.mapped_files,
             transitive = [
                 config.files,
                 generated_headers.files,
@@ -775,7 +806,7 @@ def _run_helpers_bindgen(
         ctx.actions,
         executable = ctx.executable._lineargsrun,
         inputs = depset(
-            [source],
+            [source] + c_flags.mapped_files,
             transitive = [
                 config.files,
                 generated_headers.files,
@@ -1189,7 +1220,7 @@ def _linux_rust_kernel_sdk_impl(ctx):
         feature_configuration,
         source_root,
     )
-    bindgen_c_flags = _extend_kernel_c_flags(c_flags, [
+    bindgen_c_flags = _extend_kernel_c_flags(_kernel_c_flags_without_lto(ctx, config, c_flags), [
         "-fno-builtin",
         "-D__BINDGEN__",
         "-DMODULE",
@@ -1671,6 +1702,11 @@ linux_rust_kernel_sdk = rule(
         "_lineargsrun": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/lineargsrun"),
+            executable = True,
+        ),
+        "_flagfilter": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/flagfilter"),
             executable = True,
         ),
         "_host_cc_toolchain": host_cc_toolchain_attr(),

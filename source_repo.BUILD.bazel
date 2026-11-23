@@ -212,6 +212,17 @@ cc_library(
     includes = ["scripts/include"],
 )
 
+# Headers of SELinux's genheaders host program, as its Kbuild
+# HOST_EXTRACFLAGS adds security/selinux/include.
+cc_library(
+    name = "selinux_genheaders_headers_cc",
+    hdrs = glob([
+        "security/selinux/include/classmap.h",
+        "security/selinux/include/initial_sid_to_string.h",
+    ], allow_empty = True),
+    includes = ["security/selinux/include"],
+)
+
 # objtool sources that only some releases have. Linux 7.x always links
 # klp-symid.c, because check.c references it; it runs only for --klp-symids,
 # which only scripts/livepatch/klp-build requests. The livepatch tooling itself

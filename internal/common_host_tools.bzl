@@ -53,6 +53,7 @@ def linux_common_host_tools(
     genksyms_tool = target_prefix + "_genksyms_tool"
     kallsyms_tool = target_prefix + "_kallsyms_tool"
     resolve_btfids_tool = target_prefix + "_resolve_btfids_tool"
+    selinux_genheaders_tool = target_prefix + "_selinux_genheaders_tool"
     sorttable_tool = target_prefix + "_sorttable_tool"
 
     genksyms_dir = target_prefix + ".genksyms"
@@ -99,6 +100,15 @@ def linux_common_host_tools(
         deps = [source_label(source_repo, "linux_headers_cc")],
     )
 
+    # security/selinux/genheaders writes SELinux's flask.h and
+    # av_permissions.h.
+    cc_binary(
+        name = selinux_genheaders_tool,
+        srcs = [source_label(source_repo, "security/selinux/genheaders.c")],
+        visibility = visibility,
+        deps = [source_label(source_repo, "selinux_genheaders_headers_cc")],
+    )
+
     cc_binary(
         name = kallsyms_tool,
         srcs = [source_label(source_repo, "scripts/kallsyms.c")],
@@ -141,6 +151,7 @@ def linux_common_host_tools(
         resolve_btfids_tool = package_label(resolve_btfids_tool),
         sorttable_tool = package_label(sorttable_tool),
         source_asn1_compiler = package_label(asn1_compiler),
+        source_selinux_genheaders = package_label(selinux_genheaders_tool),
         source_label_package = source_label_package(source_repo),
         source_repo = source_repo,
         source_root = source_root,

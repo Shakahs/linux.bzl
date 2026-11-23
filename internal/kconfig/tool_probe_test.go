@@ -220,7 +220,7 @@ func TestLinuxToolProbeAllowsARMAPCSMachineFlag(t *testing.T) {
 	}
 }
 
-func TestLinuxToolProbeRejectsUnpinnedVersion(t *testing.T) {
+func TestLinuxToolProbeRejectsVersionBeforeBaseline(t *testing.T) {
 	dir := t.TempDir()
 	clang := filepath.Join(dir, "clang")
 	lld := filepath.Join(dir, "ld.lld")
@@ -230,7 +230,7 @@ func TestLinuxToolProbeRejectsUnpinnedVersion(t *testing.T) {
 		Profile: "x86_64", Architecture: "x86", TargetTriple: "x86_64-linux-gnu",
 		ClangPath: clang, LLDPath: lld,
 	})
-	if err == nil || !strings.Contains(err.Error(), "want pinned LLVM") {
+	if err == nil || !strings.Contains(err.Error(), "older than the LLVM") {
 		t.Fatalf("NewLinuxToolProbe() error = %v", err)
 	}
 }

@@ -78,7 +78,7 @@ def _crate_root(ctx):
     return sources[0]
 
 def _crate_name(ctx):
-    name = ctx.label.name.replace("-", "_")
+    name = (getattr(ctx.attr, "module_name", "") or ctx.label.name).replace("-", "_")
     if name[0] >= "0" and name[0] <= "9":
         name = "_" + name
     for character in name.elems():
@@ -148,12 +148,22 @@ def _compile_external_rust(ctx, sdk, crate_root, crate_name):
         "Processing Rust-for-Linux module with objtool %{label}",
     )
 
-def _external_c_arguments(ctx, sdk, source, module_name, output = None, preprocess = False, depfile = None):
+def _include_dir_anchors(ctx):
+    anchors = []
+    seen = {}
+    for file in ctx.files.include_dirs:
+        key = file.dirname
+        if key not in seen:
+            seen[key] = True
+            anchors.append(directory_anchor(file))
+    return anchors
+
+def _external_c_arguments(ctx, sdk, source, module_name, object_name, output = None, preprocess = False, depfile = None):
     args = ctx.actions.args()
     linux_module_actions.add_target_c_flags(args, sdk.target_c_flags)
     args.add_all(linux_module_cc_helpers.module_flags("m"))
     args.add_all(linux_module_cc_helpers.object_name_flags(
-        module_name + ".o",
+        object_name + ".o",
         module_name + ".o",
     ))
     args.add_all(linux_module_actions.module_metadata_sanitizer_flags(
@@ -162,6 +172,8 @@ def _external_c_arguments(ctx, sdk, source, module_name, output = None, preproce
         sdk.version,
     ))
     add_directory_arg(args, directory_anchor(source), format = "-I%s")
+    for anchor in _include_dir_anchors(ctx):
+        add_directory_arg(args, anchor, format = "-I%s")
     args.add_all(ctx.attr.copts)
     if preprocess:
         args.add_all(["-E", "-D__GENKSYMS__"])
@@ -177,36 +189,55 @@ def _external_c_arguments(ctx, sdk, source, module_name, output = None, preproce
         args.add(output)
     return args
 
-def _compile_external_c(ctx, sdk, source, module_name):
-    raw = ctx.actions.declare_file(ctx.label.name + ".external/" + module_name + ".o.raw")
-    depfile = ctx.actions.declare_file(ctx.label.name + ".external/" + module_name + ".o.d")
+def _external_c_inputs(ctx):
+    return ctx.files.srcs + ctx.files.hdrs + ctx.files.include_dirs
+
+def _lto_enabled(config):
+    return config.config_flags.get("CONFIG_LTO_CLANG") == "y"
+
+def _delay_objtool(config):
+    """Reports Kbuild's delay-objtool, which defers objtool to linked objects."""
+    return _lto_enabled(config) or config.config_flags.get("CONFIG_X86_KERNEL_IBT") == "y"
+
+def _compile_external_c(ctx, sdk, source, module_name, object_name, single):
+    raw = ctx.actions.declare_file(ctx.label.name + ".external/" + object_name + ".o.raw")
+    depfile = ctx.actions.declare_file(ctx.label.name + ".external/" + object_name + ".o.d")
     path_mapped_run(
         ctx.actions,
         executable = sdk.target.compiler,
-        inputs = _sdk_target_inputs(sdk, ctx.files.srcs),
+        inputs = _sdk_target_inputs(sdk, _external_c_inputs(ctx)),
         outputs = [raw, depfile],
         arguments = [_external_c_arguments(
             ctx,
             sdk,
             source,
             module_name,
+            object_name,
             output = raw,
             depfile = depfile,
         )],
         mnemonic = "LinuxCModuleCompile",
-        progress_message = "Compiling out-of-tree C Linux module %{label}",
+        progress_message = "Compiling out-of-tree C Linux module %{label} " + object_name,
     )
 
-    out = ctx.actions.declare_file(ctx.label.name + ".external/" + module_name + ".o")
+    # A member of a multi-object module takes objtool's module-member mode,
+    # which Kbuild's delay-objtool defers to the linked module under LTO or
+    # IBT. A single-object module is a standard module object, which
+    # Kbuild's cmd_ld_single first relinks into ELF under LTO, because
+    # neither objtool nor modpost reads LLVM bitcode.
+    objtool_input = raw
+    if single and _lto_enabled(sdk.config):
+        objtool_input = _link_external_objects(ctx, sdk, [raw], object_name + ".elf")
+    out = ctx.actions.declare_file(ctx.label.name + ".external/" + object_name + ".o")
     out = linux_module_actions.process_objtool(
         ctx,
         sdk.config,
         sdk.objtool,
-        raw,
+        objtool_input,
         out,
-        "module",
+        "module" if single else "module-member",
         "LinuxCModuleObjtool",
-        "Processing out-of-tree C Linux module with objtool %{label}",
+        "Processing out-of-tree C Linux module with objtool %{label} " + object_name,
     )
     symversion_record = None
     symversion_cmd = None
@@ -216,7 +247,7 @@ def _compile_external_c(ctx, sdk, source, module_name):
         if not sdk.genksyms:
             fail("%s requires a configured genksyms tool for CONFIG_MODVERSIONS=y" % ctx.label)
         cmd = ctx.actions.declare_file(
-            ctx.label.name + ".external/symversions/" + module_name + ".o.cmd",
+            ctx.label.name + ".external/symversions/" + object_name + ".o.cmd",
         )
         runner_args = ctx.actions.args()
         runner_args.add("-mode", "c")
@@ -230,7 +261,7 @@ def _compile_external_c(ctx, sdk, source, module_name):
         extra_inputs = []
         if not linux_module_actions.version_at_least(sdk.version, 6, 18):
             reference = ctx.actions.declare_file(
-                ctx.label.name + ".external/symversions/" + module_name + ".symref",
+                ctx.label.name + ".external/symversions/" + object_name + ".symref",
             )
             ctx.actions.write(reference, "")
             runner_args.add("-reference", reference)
@@ -239,7 +270,7 @@ def _compile_external_c(ctx, sdk, source, module_name):
         path_mapped_run(
             ctx.actions,
             executable = ctx.executable._genksymsrun,
-            inputs = _sdk_target_inputs(sdk, ctx.files.srcs + [raw] + extra_inputs),
+            inputs = _sdk_target_inputs(sdk, _external_c_inputs(ctx) + [raw] + extra_inputs),
             tools = [llvm_nm, sdk.genksyms],
             outputs = [cmd],
             arguments = [
@@ -249,24 +280,25 @@ def _compile_external_c(ctx, sdk, source, module_name):
                     sdk,
                     source,
                     module_name,
+                    object_name,
                     preprocess = True,
                 ),
             ],
             mnemonic = "LinuxGenksyms",
-            progress_message = "Generating external Linux module symbol versions %{label}",
+            progress_message = "Generating external Linux module symbol versions %{label} " + object_name,
         )
         symversion_record = struct(
             cmd = cmd,
-            object = module_name + ".o",
+            object = object_name + ".o",
         )
         symversion_cmd = cmd
     source_cmd = ctx.actions.declare_file(
-        ctx.label.name + ".external/source_versions/." + module_name + ".o.cmd",
+        ctx.label.name + ".external/source_versions/." + object_name + ".o.cmd",
     )
-    source_path = module_name + ".c"
+    source_path = object_name + ".c"
     source_args = ctx.actions.args()
     source_args.add("-depfile", depfile)
-    source_args.add("-object", module_name + ".o")
+    source_args.add("-object", object_name + ".o")
     source_args.add("-out", source_cmd)
     source_args.add("-primary", source_path)
     source_inputs = [depfile, source]
@@ -289,11 +321,37 @@ def _compile_external_c(ctx, sdk, source, module_name):
         object = out,
         source_version_record = struct(
             cmd = source_cmd,
-            object = module_name + ".o",
+            object = object_name + ".o",
             path_files = [struct(file = source, path = source_path)],
         ),
         symversion_record = symversion_record,
     )
+
+def _link_external_objects(ctx, sdk, objects, module_name):
+    out = ctx.actions.declare_file(ctx.label.name + ".external/linked/" + module_name + ".o")
+    args = ctx.actions.args()
+    args.add_all(sdk.target_link_flags)
+    args.add_all(["-fuse-ld=lld", "-nostdlib", "-r"])
+
+    # Under LTO, LLD performs the LTO code generation of the bitcode members,
+    # with KBUILD_LDFLAGS' cross-unit inlining limit.
+    if sdk.config.config_flags.get("CONFIG_LTO_CLANG_FULL") == "y":
+        args.add_all(["-flto", "-Wl,-mllvm,-import-instr-limit=5"])
+    elif _lto_enabled(sdk.config):
+        args.add_all(["-flto=thin", "-Wl,-mllvm,-import-instr-limit=5"])
+    args.add("-o")
+    args.add(out)
+    args.add_all(objects)
+    path_mapped_run(
+        ctx.actions,
+        executable = sdk.target.linker,
+        inputs = depset(objects, transitive = [sdk.target.cc_toolchain.all_files]),
+        outputs = [out],
+        arguments = [args],
+        mnemonic = "LinuxModuleObjectsLink",
+        progress_message = "Linking out-of-tree C Linux module objects %{label}",
+    )
+    return out
 
 def _add_rust_sdk_flags(args, sdk, flags):
     rust = sdk.rust
@@ -337,28 +395,43 @@ def _check_external_modinfo(ctx, preliminary, crate_name, allow_version = False)
     )
     return checked
 
-def _external_modpost(ctx, sdk, preliminary, crate_name, modinfo_check, source_version_record = None, symversion_record = None):
+def _external_modpost(ctx, sdk, preliminary, crate_name, modinfo_check, source_version_record = None, symversion_record = None, source_version_records = None, symversion_records = None, prebuilt_members = []):
+    if source_version_records == None:
+        source_version_records = [source_version_record] if source_version_record != None else []
+    if symversion_records == None:
+        symversion_records = [symversion_record] if symversion_record != None else []
     stage = ctx.label.name + ".external/modpost"
     staged_object = ctx.actions.declare_file(stage + "/" + crate_name + ".o")
     ctx.actions.symlink(output = staged_object, target_file = preliminary)
     manifest = ctx.actions.declare_file(stage + "/" + crate_name + ".mod")
-    ctx.actions.write(manifest, crate_name + ".o\n")
+    members = [record.object for record in source_version_records] + prebuilt_members
+    if not members:
+        members = [crate_name + ".o"]
+    ctx.actions.write(manifest, "".join([member + "\n" for member in members]))
     source_version_inputs = []
-    if source_version_record != None:
+    for record in source_version_records:
         staged_source_cmd = ctx.actions.declare_file(
-            stage + "/" + linux_module_actions.symversion_cmd_path(source_version_record.object),
+            stage + "/" + linux_module_actions.symversion_cmd_path(record.object),
         )
-        ctx.actions.symlink(output = staged_source_cmd, target_file = source_version_record.cmd)
+        ctx.actions.symlink(output = staged_source_cmd, target_file = record.cmd)
         source_version_inputs.append(staged_source_cmd)
-        for path_file in source_version_record.path_files:
+        for path_file in record.path_files:
             staged_source = ctx.actions.declare_file(stage + "/" + path_file.path)
             ctx.actions.symlink(output = staged_source, target_file = path_file.file)
             source_version_inputs.append(staged_source)
+
+    # Prebuilt member objects carry neither exported-symbol CRCs nor sources.
+    for member in prebuilt_members:
+        placeholder = ctx.actions.declare_file(
+            stage + "/" + linux_module_actions.symversion_cmd_path(member),
+        )
+        ctx.actions.write(placeholder, "")
+        source_version_inputs.append(placeholder)
     symversion_inputs = []
     if sdk.config.config_flags.get("CONFIG_MODVERSIONS") == "y":
-        if symversion_record == None:
+        if not symversion_records:
             fail("%s requires C symbol-version records for CONFIG_MODVERSIONS=y" % ctx.label)
-        if source_version_record == None:
+        if not source_version_records:
             fail("%s requires combined source and symbol-version records for CONFIG_MODVERSIONS=y" % ctx.label)
     modules_order = ctx.actions.declare_file(stage + "/modules.order")
     ctx.actions.write(modules_order, crate_name + ".o\n")
@@ -499,12 +572,54 @@ def _linux_cc_module_impl(ctx):
     sdk = ctx.attr.kernel[LinuxModuleSdkInfo]
     if sdk.config.config_flags.get("CONFIG_MODULES") != "y":
         fail("%s requires a kernel with CONFIG_MODULES=y" % ctx.label)
-    if len(ctx.files.srcs) != 1:
-        fail("%s requires exactly one C source" % ctx.label)
-    source = ctx.files.srcs[0]
+    if not ctx.files.srcs:
+        fail("%s requires at least one C source" % ctx.label)
     module_name = _crate_name(ctx)
-    compiled = _compile_external_c(ctx, sdk, source, module_name)
-    preliminary = compiled.object
+    prebuilt = ctx.files.objects
+    single = len(ctx.files.srcs) == 1 and not prebuilt
+    compiled = []
+    object_names = {}
+    for source in ctx.files.srcs:
+        if single:
+            object_name = module_name
+        else:
+            object_name = source.basename[:-len(".c")]
+            if object_name in object_names:
+                fail("%s has two sources named %s.c; object names must be unique" % (ctx.label, object_name))
+            object_names[object_name] = True
+        compiled.append(_compile_external_c(ctx, sdk, source, module_name, object_name, single))
+    prebuilt_members = []
+    for obj in prebuilt:
+        member = obj.basename
+        if member.endswith("_binary"):
+            member = member[:-len("_binary")]
+        if not member.endswith(".o") or member[:-len(".o")] in object_names:
+            fail("%s prebuilt object %s must name a distinct .o member" % (ctx.label, obj.basename))
+        prebuilt_members.append(member)
+    if single:
+        preliminary = compiled[0].object
+    else:
+        linked_members = _link_external_objects(
+            ctx,
+            sdk,
+            [record.object for record in compiled] + prebuilt,
+            module_name,
+        )
+
+        # Kbuild's multi-object module rule runs objtool only when
+        # delay-objtool deferred it from the members.
+        preliminary = linked_members
+        if _delay_objtool(sdk.config):
+            preliminary = linux_module_actions.process_objtool(
+                ctx,
+                sdk.config,
+                sdk.objtool,
+                linked_members,
+                ctx.actions.declare_file(ctx.label.name + ".external/objtool/" + module_name + ".o"),
+                "module",
+                "LinuxCModuleObjtool",
+                "Processing out-of-tree C Linux module with objtool %{label}",
+            )
     modinfo_check = _check_external_modinfo(ctx, preliminary, module_name, allow_version = True)
     mod_source, module_symvers = _external_modpost(
         ctx,
@@ -512,8 +627,9 @@ def _linux_cc_module_impl(ctx):
         preliminary,
         module_name,
         modinfo_check,
-        source_version_record = compiled.source_version_record,
-        symversion_record = compiled.symversion_record,
+        source_version_records = [record.source_version_record for record in compiled],
+        symversion_records = [record.symversion_record for record in compiled if record.symversion_record != None],
+        prebuilt_members = prebuilt_members,
     )
     mod_object = _compile_external_mod_source(ctx, sdk, mod_source, module_name)
     linked = _link_module(
@@ -890,6 +1006,21 @@ _linux_cc_module = rule(
             mandatory = True,
             providers = [LinuxModuleSdkInfo],
         ),
+        "hdrs": attr.label_list(
+            allow_files = True,
+            doc = "Headers the sources include, including generated headers.",
+        ),
+        "include_dirs": attr.label_list(
+            allow_files = True,
+            doc = "Files whose containing directories are added as -I include paths.",
+        ),
+        "module_name": attr.string(
+            doc = "Module name; defaults to the target name.",
+        ),
+        "objects": attr.label_list(
+            allow_files = True,
+            doc = "Prebuilt relocatable objects linked into the module. A trailing _binary suffix is dropped from the member name.",
+        ),
         "srcs": attr.label_list(
             allow_files = [".c"],
             mandatory = True,
@@ -920,7 +1051,7 @@ _linux_cc_module = rule(
             executable = True,
         ),
     },
-    doc = "Builds one out-of-tree C Linux loadable module.",
+    doc = "Builds one out-of-tree C Linux loadable module from one or more C sources and optional prebuilt objects.",
 )
 
 def linux_module(

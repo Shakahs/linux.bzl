@@ -6,13 +6,19 @@ are implementation details and may change without notice.
 
 load("//internal:initramfs.bzl", _initramfs = "initramfs")
 load("//internal:linux_image_repository.bzl", _linux_image_repository = "linux_image")
+load("//internal:linux_module_actions.bzl", _linux_module_actions = "linux_module_actions")
 load("//internal:linux_modules.bzl", _linux_cc_module = "linux_cc_module", _linux_module = "linux_module")
 load("//internal:linux_source_repository.bzl", _linux_source_repository = "linux_source_repository")
-load("//internal:providers.bzl", _LinuxKernelInfo = "LinuxKernelInfo")
+load("//internal:providers.bzl", _LinuxKernelInfo = "LinuxKernelInfo", _LinuxModuleSdkInfo = "LinuxModuleSdkInfo")
 
 visibility("public")
 
 LinuxKernelInfo = _LinuxKernelInfo
+
+# Configured-kernel module build inputs (generated headers, target C flags,
+# Module.symvers) for rules that run kernel feature probes.
+LinuxModuleSdkInfo = _LinuxModuleSdkInfo
+linux_module_actions = _linux_module_actions
 initramfs = _initramfs
 linux_cc_module = _linux_cc_module
 linux_module = _linux_module

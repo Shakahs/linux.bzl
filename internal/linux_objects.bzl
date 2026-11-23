@@ -2243,6 +2243,26 @@ def _linux_object_generated_inputs(ctx, compiler, linker, cc_toolchain, feature_
         include_dirs.append(out.dirname)
         include_dir_anchors[out.dirname] = directory_anchor(out)
 
+    if ctx.executable.selinux_genheaders:
+        # Kbuild writes both headers into security/selinux, the -I$(obj) of
+        # every selinux-y object, including those under ss/.
+        flask_h = ctx.actions.declare_file(ctx.label.name + ".obj/security/selinux/flask.h")
+        av_permissions_h = ctx.actions.declare_file(ctx.label.name + ".obj/security/selinux/av_permissions.h")
+        args = ctx.actions.args()
+        args.add(flask_h)
+        args.add(av_permissions_h)
+        path_mapped_run(
+            ctx.actions,
+            executable = ctx.executable.selinux_genheaders,
+            outputs = [flask_h, av_permissions_h],
+            arguments = [args],
+            mnemonic = "LinuxSELinuxGenheaders",
+            progress_message = "Generating Linux SELinux headers %{label}",
+        )
+        files.extend([flask_h, av_permissions_h])
+        include_dirs.append(flask_h.dirname)
+        include_dir_anchors[flask_h.dirname] = directory_anchor(flask_h)
+
     if ctx.attr.object == "arch/x86/lib/inat.o":
         opcode_map = _source_tree_file(ctx, "arch/x86/lib/x86-opcode-map.txt")
         inat_h = _source_tree_file(ctx, "arch/x86/include/asm/inat.h")
@@ -6852,6 +6872,11 @@ linux_object = rule(
             doc = "Kernel-source-specific scripts/asn1_compiler executable. Required only for .asn1.o objects.",
             executable = True,
         ),
+        "selinux_genheaders": attr.label(
+            cfg = "exec",
+            doc = "Kernel-source-specific security/selinux/genheaders executable. Set only for SELinux objects.",
+            executable = True,
+        ),
         "relacheck": attr.label(
             cfg = "exec",
             doc = "Kernel-source-specific arch/arm64/kernel/pi/relacheck executable. Required only for arm64 .pi.o objects.",
@@ -8508,6 +8533,11 @@ linux_vmlinux = rule(
         "_offsetsheader": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/offsetsheader"),
+            executable = True,
+        ),
+        "_flagfilter": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/flagfilter"),
             executable = True,
         ),
         "_mksysmap": attr.label(

@@ -125,10 +125,13 @@ type CompactBuildFileOptions struct {
 	Exports            []string
 	SourceLabelPackage string
 	SourceASN1Compiler string
-	SourceGenksyms     string
-	SourceObjtool      string
-	SourceRelacheck    string
-	SourceRootLabel    string
+	// SourceSELinuxGenheaders labels security/selinux/genheaders, which
+	// writes the flask.h and av_permissions.h that SELinux objects include.
+	SourceSELinuxGenheaders string
+	SourceGenksyms          string
+	SourceObjtool           string
+	SourceRelacheck         string
+	SourceRootLabel         string
 	// SourceRoot is the Linux tree that SourceLabelPackage labels; include
 	// directories are passed as labels only when the directory exists there.
 	SourceRoot string
@@ -2163,7 +2166,20 @@ func compactObjectActionFootprintForObject(object string, flags []string) compac
 		isArm64NvheObject(object) {
 		footprint.fullGeneratedHeaders = true
 	}
+	if isSELinuxObject(object) {
+		footprint.providedIncludes = append(footprint.providedIncludes, selinuxGeneratedHeaders...)
+	}
 	return footprint
+}
+
+// selinuxGeneratedHeaders are the headers security/selinux/genheaders writes
+// into SELinux's object directory, which Kbuild's -I$(obj) adds.
+var selinuxGeneratedHeaders = []string{"flask.h", "av_permissions.h"}
+
+// isSELinuxObject reports whether object belongs to selinux-y, every member
+// of which Kbuild builds after genheaders writes selinuxGeneratedHeaders.
+func isSELinuxObject(object string) bool {
+	return strings.HasPrefix(object, "security/selinux/") && object != "security/selinux/selinux.o"
 }
 
 // Linux 7.x builds each x86 vDSO image in its own directory below
@@ -3154,7 +3170,7 @@ func (m *CompactMetadata) groupedCompileFallbackReason(variant CompactObjectVari
 	if len(variant.RemoveFlags) != 0 {
 		return "has Kbuild remove flags"
 	}
-	if compactGroupedSpecialObjects[variant.Object] {
+	if compactGroupedSpecialObjects[variant.Object] || isSELinuxObject(variant.Object) {
 		return "requires generated-object actions"
 	}
 	if strings.HasSuffix(variant.Object, ".asn1.o") ||
@@ -3529,6 +3545,12 @@ func (m *CompactMetadata) objectBuildFile(opts CompactBuildFileOptions) ([]byte,
 		}
 		if opts.SourceASN1Compiler != "" && strings.HasSuffix(variant.Object, ".asn1.o") {
 			r.SetAttr("asn1_compiler", opts.SourceASN1Compiler)
+		}
+		if isSELinuxObject(variant.Object) {
+			if opts.SourceSELinuxGenheaders == "" {
+				return nil, fmt.Errorf("SELinux object %q requires a genheaders label", variant.Object)
+			}
+			r.SetAttr("selinux_genheaders", opts.SourceSELinuxGenheaders)
 		}
 		if opts.Version != "" {
 			r.SetAttr("version", opts.Version)
