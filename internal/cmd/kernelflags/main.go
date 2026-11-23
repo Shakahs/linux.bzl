@@ -316,7 +316,8 @@ func linuxCFlags(config map[string]string, arch, version string) []string {
 			"-Wno-gnu-variable-sized-type-not-at-end",
 			"-Wno-initializer-overrides",
 		)
-		if enabled(config, "CONFIG_LTO_CLANG_THIN") {
+		// Distributed ThinLTO compiles the same bitcode (CC_FLAGS_LTO).
+		if enabled(config, "CONFIG_LTO_CLANG_THIN") || enabled(config, "CONFIG_LTO_CLANG_THIN_DIST") {
 			flags = append(flags, "-fno-lto", "-flto=thin", "-fsplit-lto-unit", "-fvisibility=hidden")
 		} else if enabled(config, "CONFIG_LTO_CLANG_FULL") {
 			flags = append(flags, "-fno-lto", "-flto", "-fvisibility=hidden")

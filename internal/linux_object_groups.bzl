@@ -376,6 +376,55 @@ def _source_include_dirs(source_root, srcarch, generated_headers):
         generated.other
     )
 
+_THINLTO_INPUT_FLAGS = ["-I", "-include", "-isystem", "-iquote", "-idirafter", "-imacros"]
+
+def _thinlto_backend_flags(flags):
+    # Drops flags that name preprocessor inputs, with their separate values;
+    # an IR backend compile reads none of them.
+    result = []
+    skip_value = False
+    for flag in flags:
+        if skip_value:
+            skip_value = False
+            continue
+        if flag in _THINLTO_INPUT_FLAGS:
+            skip_value = True
+            continue
+        if [prefix for prefix in _THINLTO_INPUT_FLAGS if flag.startswith(prefix)]:
+            continue
+        result.append(flag)
+    return result
+
+def _thinlto_flags(ctx, base_flags, spec, source, config, source_root):
+    """Saves a built-in C object's flags for distributed ThinLTO.
+
+    Kbuild's saved_c_flags: the vmlinux backend compiles the object's bitcode
+    again with them after the thin link.
+    """
+    if (
+        config.config_flags.get("CONFIG_LTO_CLANG_THIN_DIST") != "y" or
+        ctx.attr.language != "c" or
+        ctx.attr.mode != "y"
+    ):
+        return None, depset()
+    replacements = dict(config.config_flags)
+    replacements.update({
+        "src": source.dirname,
+        "srctree": source_root,
+    })
+    args = ctx.actions.args()
+    args.set_param_file_format("shell")
+    args.add_all(_thinlto_backend_flags(base_flags))
+    args.add(config.cflags, format = "@%s")
+    args.add_all(_object_name_flags(spec.object, ctx.attr.modname))
+    args.add_all(_thinlto_backend_flags([
+        _rewrite_source_root_flag(_expand_make_refs(flag, replacements, spec.object), source_root)
+        for flag in ctx.attr.flags
+    ]))
+    out = ctx.actions.declare_file(ctx.label.name + ".thinlto_flags/" + spec.content_id + "/" + spec.object + ".flags")
+    ctx.actions.write(out, args)
+    return out, depset([config.cflags], transitive = [config.files])
+
 def _compile_arguments(ctx, base_flags, spec, source, output, config, generated_headers, source_root, depfile = None):
     replacements = dict(config.config_flags)
     replacements.update({
@@ -768,6 +817,7 @@ def _linux_object_action_group_impl(ctx):
             mnemonic = "LinuxObjectCompile",
             progress_message = "Compiling grouped Linux object %s" % spec.object,
         )
+        thinlto_flags, thinlto_flag_inputs = _thinlto_flags(ctx, base_flags, spec, source, config, source_root)
         if use_objtool:
             _grouped_objtool(ctx, config, compile_out, out)
         symversion_records = []
@@ -865,6 +915,8 @@ def _linux_object_action_group_impl(ctx):
             output = out,
             source_version_records = source_version_records,
             symversion_records = symversion_records,
+            thinlto_flags = thinlto_flags,
+            thinlto_flag_inputs = thinlto_flag_inputs,
         )
         objects[target] = info
         outputs.append(out)

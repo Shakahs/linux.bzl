@@ -71,6 +71,8 @@ LinuxObjectInfo = provider(
         "output": "Object output file.",
         "source_version_records": "Ordered per-leaf source-version records used by modpost.",
         "symversion_records": "Ordered per-leaf symbol-version records as structs with object and cmd fields.",
+        "thinlto_flags": "Saved compiler flags for the distributed ThinLTO backend, or None.",
+        "thinlto_flag_inputs": "Depset of response files that thinlto_flags references.",
     },
 )
 
@@ -1000,10 +1002,37 @@ def _linux_filtered_config_flags_for_source(
     )
     return struct(flags = [out], inputs = [out])
 
+def _linux_lto_thin(config):
+    # Kbuild compiles the same ThinLTO bitcode in in-process and distributed
+    # mode; only the vmlinux link differs.
+    return config.config_flags.get("CONFIG_LTO_CLANG_THIN") == "y" or _linux_lto_thin_dist(config)
+
+def _linux_lto_thin_dist(config):
+    return config.config_flags.get("CONFIG_LTO_CLANG_THIN_DIST") == "y"
+
+_LINUX_THINLTO_INPUT_FLAGS = ["-I", "-include", "-isystem", "-iquote", "-idirafter", "-imacros"]
+
+def _linux_thinlto_backend_flags(flags):
+    # Drops flags that name preprocessor inputs, with their separate values;
+    # an IR backend compile reads none of them.
+    result = []
+    skip_value = False
+    for flag in flags:
+        if skip_value:
+            skip_value = False
+            continue
+        if flag in _LINUX_THINLTO_INPUT_FLAGS:
+            skip_value = True
+            continue
+        if [prefix for prefix in _LINUX_THINLTO_INPUT_FLAGS if flag.startswith(prefix)]:
+            continue
+        result.append(flag)
+    return result
+
 def _linux_non_lto_config_flags_for_source(ctx, config, src, out_suffix = "nolto"):
     if not config:
         return struct(flags = [], inputs = [])
-    if config.config_flags.get("CONFIG_LTO_CLANG_THIN") != "y" and config.config_flags.get("CONFIG_LTO_CLANG_FULL") != "y":
+    if not _linux_lto_thin(config) and config.config_flags.get("CONFIG_LTO_CLANG_FULL") != "y":
         return struct(flags = _linux_config_flags_for_source(config, src), inputs = [])
     return _linux_filtered_config_flags_for_source(
         ctx,
@@ -6576,6 +6605,23 @@ def _linux_object_impl(ctx):
     args.add("-o")
     args.add(compile_out)
 
+    # Distributed ThinLTO compiles each built-in C object's bitcode again
+    # after the vmlinux thin link, with the object's own flags, as Kbuild's
+    # saved_c_flags. Include and preprocessor-input flags do not apply to IR.
+    thinlto_flags = None
+    thinlto_flag_inputs = depset()
+    if config and _linux_lto_thin_dist(config) and ctx.attr.mode == "y" and not _is_assembly_source(src):
+        thinlto_args = ctx.actions.args()
+        thinlto_args.set_param_file_format("shell")
+        thinlto_args.add_all(_linux_thinlto_backend_flags(base_flags))
+        thinlto_args.add_all(config_flag_inputs.flags, format_each = "@%s")
+        thinlto_args.add_all(_linux_module_flags(ctx.attr.mode))
+        thinlto_args.add_all(_linux_object_name_flags(compile_object, ctx.attr.modname))
+        thinlto_args.add_all(_linux_thinlto_backend_flags(expanded_flags))
+        thinlto_flags = ctx.actions.declare_file(ctx.label.name + ".thinlto_flags")
+        ctx.actions.write(thinlto_flags, thinlto_args)
+        thinlto_flag_inputs = depset(config_flag_inputs.inputs, transitive = [config.files])
+
     direct_inputs = [src] + generated_object_headers + generated_sources + generated_inputs.files + config_flag_inputs.inputs
     if src != source_file:
         direct_inputs.append(source_file)
@@ -6794,6 +6840,8 @@ def _linux_object_impl(ctx):
         generated_header_path_files = exported_generated_header_path_files,
         generated_include_dir_anchors = _directory_anchors(exported_generated_headers, exported_generated_include_dirs),
         generated_include_dirs = exported_generated_include_dirs,
+        thinlto_flags = thinlto_flags,
+        thinlto_flag_inputs = thinlto_flag_inputs,
     )
     return [
         DefaultInfo(files = depset([out, cmd])),
@@ -8138,7 +8186,7 @@ def _linux_vmlinux_link_flags(ctx, config):
         flags.append("-Wl,%s,%s" % (spec.vmlinux_flags[index], spec.vmlinux_flags[index + 1]))
     if config.config_flags.get("CONFIG_LD_DEAD_CODE_DATA_ELIMINATION") == "y":
         flags.append("-Wl,--gc-sections")
-    if config.config_flags.get("CONFIG_LTO_CLANG_THIN") == "y":
+    if _linux_lto_thin(config):
         flags.extend([
             "-flto=thin",
             "-Wl,-mllvm,-import-instr-limit=5",
@@ -8156,7 +8204,7 @@ def _linux_vmlinux_link_flags(ctx, config):
     return flags
 
 def _linux_vmlinux_initcalls_linker_script(ctx, config):
-    if config.config_flags.get("CONFIG_LTO_CLANG_THIN") != "y" and config.config_flags.get("CONFIG_LTO_CLANG_FULL") != "y":
+    if not _linux_lto_thin(config) and config.config_flags.get("CONFIG_LTO_CLANG_FULL") != "y":
         return None
 
     out = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_initcalls.lds")
@@ -8184,7 +8232,84 @@ def _linux_vmlinux_initcalls_linker_script(ctx, config):
 """)
     return out
 
-def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, extra_objects):
+def _linux_vmlinux_thinlto_dist(ctx, config, linker, compiler, cc_toolchain, image):
+    """Kbuild's distributed ThinLTO for vmlinux.a (scripts/Makefile.vmlinux_a).
+
+    Returns the native objects, in vmlinux.a order, that replace the bitcode
+    objects in the relocatable vmlinux.o link.
+    """
+    spec = linux_vmlinux_link_spec(ctx.attr.arch)
+    prefix = ctx.label.name + ".thinlto/"
+    objects = [info.output for info in image.objects]
+    entries = []
+    manifest_lines = []
+    index_outputs = []
+    for info in image.objects:
+        index = ctx.actions.declare_file(prefix + info.object + ".thinlto.bc")
+        imports = ctx.actions.declare_directory(prefix + info.object + ".thinlto-imports")
+        entries.append(struct(info = info, index = index, imports = imports))
+        manifest_lines.append("%s\t%s\t%s" % (info.output.path, index.path, imports.path))
+        index_outputs.extend([index, imports])
+    manifest = ctx.actions.declare_file(prefix + "manifest")
+    ctx.actions.write(manifest, "\n".join(manifest_lines) + "\n")
+
+    # The thin link runs ld.lld itself, as Kbuild runs
+    # $(LD) $(KBUILD_LDFLAGS) -r --thinlto-index-only.
+    index_args = ctx.actions.args()
+    index_args.add("index")
+    index_args.add("-manifest", manifest)
+    index_args.add("--")
+    index_args.add(_linux_x86_tool_sibling(linker, "ld.lld"))
+    index_args.add_all(_linux_link_endian_flags(ctx.attr.arch, config))
+    index_args.add_all(["-m", spec.emulation])
+    if spec.direct_lld:
+        index_args.add_all(spec.relocatable_flags)
+    index_args.add_all(["-z", "noexecstack", "-r", "-mllvm", "-import-instr-limit=5"])
+    index_args.add_all(objects)
+    ctx.actions.run(
+        executable = ctx.executable._thinltorun,
+        inputs = depset([manifest] + objects, transitive = [cc_toolchain.all_files]),
+        outputs = index_outputs,
+        arguments = [index_args],
+        mnemonic = "LinuxVmlinuxThinLink",
+        progress_message = "Indexing Linux vmlinux ThinLTO %{label}",
+    )
+
+    # One backend per object: Kbuild's cmd_cc_o_bc in scripts/Makefile.thinlto.
+    native_objects = []
+    for entry in entries:
+        info = entry.info
+        flags = getattr(info, "thinlto_flags", None)
+        object_path = info.object[:-len(".o")] if info.object.endswith(".o") else info.object
+        native = ctx.actions.declare_file(prefix + object_path + ".thinlto-native.o")
+        args = ctx.actions.args()
+        args.add("backend")
+        args.add("-in", info.output)
+        args.add("-index", entry.index)
+        args.add("-imports", entry.imports.path)
+        args.add("-out", native)
+        inputs = [info.output, entry.index, entry.imports]
+        flag_inputs = []
+        if flags == None:
+            args.add("-native_only")
+        args.add("--")
+        args.add(compiler)
+        if flags != None:
+            args.add(flags, format = "@%s")
+            inputs.append(flags)
+            flag_inputs.append(info.thinlto_flag_inputs)
+        ctx.actions.run(
+            executable = ctx.executable._thinltorun,
+            inputs = depset(inputs, transitive = flag_inputs + [cc_toolchain.all_files]),
+            outputs = [native],
+            arguments = [args],
+            mnemonic = "LinuxVmlinuxThinLTOBackend",
+            progress_message = "Compiling Linux ThinLTO backend %s" % info.object,
+        )
+        native_objects.append(native)
+    return native_objects
+
+def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, extra_objects, native_objects = None):
     out = ctx.actions.declare_file(ctx.label.name + ".obj/vmlinux.o")
     initcalls_linker_script = _linux_vmlinux_initcalls_linker_script(ctx, config)
     args = ctx.actions.args()
@@ -8199,7 +8324,7 @@ def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature
             "noexecstack",
             "-r",
         ]
-        if config.config_flags.get("CONFIG_LTO_CLANG_THIN") == "y":
+        if _linux_lto_thin(config):
             flags.extend([
                 "-mllvm",
                 "-import-instr-limit=5",
@@ -8218,7 +8343,12 @@ def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature
             args.add("-T")
             args.add(initcalls_linker_script)
         args.add("--whole-archive")
-        args.add(image_object)
+        if native_objects != None:
+            # Kbuild's distributed vmlinux.a lists the native objects in the
+            # bitcode objects' order.
+            args.add_all(native_objects)
+        else:
+            args.add(image_object)
         args.add_all(extra_objects)
         args.add("--no-whole-archive")
     else:
@@ -8231,7 +8361,7 @@ def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature
             "-Wl,-r",
             "-Wl,-m," + spec.emulation,
         ]
-        if config.config_flags.get("CONFIG_LTO_CLANG_THIN") == "y":
+        if _linux_lto_thin(config):
             flags.extend([
                 "-flto=thin",
                 "-Wl,-mllvm,-import-instr-limit=5",
@@ -8249,7 +8379,10 @@ def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature
         if initcalls_linker_script:
             args.add(initcalls_linker_script, format = "-Wl,-T,%s")
         args.add("-Wl,--whole-archive")
-        args.add(image_object)
+        if native_objects != None:
+            args.add_all(native_objects)
+        else:
+            args.add(image_object)
         args.add_all(extra_objects)
         args.add("-Wl,--no-whole-archive")
 
@@ -8257,8 +8390,8 @@ def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature
         ctx.actions,
         executable = executable,
         inputs = depset(
-            [image_object] + extra_objects + ([initcalls_linker_script] if initcalls_linker_script else []),
-            transitive = [image_object_inputs, cc_toolchain.all_files],
+            ([image_object] if native_objects == None else native_objects) + extra_objects + ([initcalls_linker_script] if initcalls_linker_script else []),
+            transitive = [image_object_inputs if native_objects == None else depset(), cc_toolchain.all_files],
         ),
         outputs = [out],
         arguments = [args],
@@ -8267,7 +8400,7 @@ def _linux_vmlinux_relocatable_object(ctx, config, linker, cc_toolchain, feature
     )
     return out
 
-def _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, extra_objects):
+def _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, extra_objects, native_objects = None):
     # Upstream modpost consumes vmlinux.o even when neither LTO nor objtool is
     # enabled. Always materialize the relocatable link so the configured kernel
     # can expose a complete private module SDK without reconstructing it later.
@@ -8280,6 +8413,7 @@ def _linux_vmlinux_objtool(ctx, config, linker, cc_toolchain, feature_configurat
         image_object,
         image_object_inputs,
         extra_objects,
+        native_objects = native_objects,
     )
     if not ctx.executable.objtool:
         return image_object
@@ -8349,6 +8483,9 @@ def _linux_vmlinux_impl(ctx):
         extra_flags = ["-fno-function-sections", "-fno-data-sections", "-include", "generated/utsversion.h"],
     )
     image_object_inputs = depset([info.output for info in image.objects])
+    native_objects = None
+    if _linux_lto_thin_dist(config):
+        native_objects = _linux_vmlinux_thinlto_dist(ctx, config, linker, compiler, cc_toolchain, image)
     image_object = _linux_vmlinux_objtool(
         ctx,
         config,
@@ -8358,6 +8495,7 @@ def _linux_vmlinux_impl(ctx):
         image.output,
         image_object_inputs,
         rust_sdk.runtime_objects,
+        native_objects = native_objects,
     )
     module_prep = linux_module_actions.prepare(
         ctx,
@@ -8553,6 +8691,11 @@ linux_vmlinux = rule(
         "_objtoolrun": attr.label(
             cfg = "exec",
             default = Label("//internal/cmd/objtoolrun"),
+            executable = True,
+        ),
+        "_thinltorun": attr.label(
+            cfg = "exec",
+            default = Label("//internal/cmd/thinltorun"),
             executable = True,
         ),
         "_sorttablerun": attr.label(
