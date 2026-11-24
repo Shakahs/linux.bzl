@@ -8031,7 +8031,71 @@ def _linux_btf_object(ctx, cc_toolchain, config, input):
     )
     return out
 
-def _linux_resolve_btfids(ctx, config, input):
+def _linux_btf_object_with_ids(ctx, cc_toolchain, config, input, template_object):
+    if not ctx.executable.pahole or not ctx.executable.resolve_btfids_tool:
+        fail("linux_vmlinux %s has DEBUG_INFO_BTF enabled and requires pahole and resolve_btfids" % ctx.label)
+
+    raw_btf = ctx.actions.declare_file(input.basename + ".BTF.1", sibling = input)
+    encode_args = ctx.actions.args()
+    encode_args.add("-J")
+    encode_args.add_all(linux_module_actions.pahole_flags(config, ctx.attr.version))
+    encode_args.add(raw_btf, format = "--btf_encode_detached=%s")
+    encode_args.add(input)
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable.pahole,
+        tools = [ctx.attr.pahole[DefaultInfo].files_to_run],
+        inputs = [input],
+        outputs = [raw_btf],
+        arguments = [encode_args],
+        mnemonic = "LinuxBTFEncode",
+        progress_message = "Encoding Linux vmlinux BTF %{label}",
+    )
+
+    # Linux 7.3's resolver opens the ELF read-write and writes sidecars
+    # alongside it. Give it a writable copy and declare both sidecars.
+    resolver_elf = ctx.actions.declare_file(input.basename + ".resolve", sibling = input)
+    resolved_btf = ctx.actions.declare_file(resolver_elf.basename + ".BTF", sibling = resolver_elf)
+    resolved_ids = ctx.actions.declare_file(resolver_elf.basename + ".BTF_ids", sibling = resolver_elf)
+    resolve_args = ctx.actions.args()
+    resolve_args.add("-input", input)
+    resolve_args.add("-output", resolver_elf)
+    resolve_args.add("--")
+    resolve_args.add(ctx.executable.resolve_btfids_tool)
+    if config.config_flags.get("CONFIG_WERROR") == "y":
+        resolve_args.add("--fatal_warnings")
+    resolve_args.add("--btf", raw_btf)
+    resolve_args.add("{output}")
+    path_mapped_run(
+        ctx.actions,
+        executable = ctx.executable._btfmutate,
+        tools = [ctx.attr.resolve_btfids_tool[DefaultInfo].files_to_run],
+        inputs = [input, raw_btf],
+        outputs = [resolver_elf, resolved_btf, resolved_ids],
+        arguments = [resolve_args],
+        mnemonic = "LinuxBTFResolve",
+        progress_message = "Resolving Linux vmlinux BTF data %{label}",
+    )
+
+    btf_object = ctx.actions.declare_file(input.basename + ".btf.o", sibling = input)
+    object_args = ctx.actions.args()
+    object_args.add("--add-section")
+    object_args.add(resolved_btf, format = ".BTF=%s")
+    object_args.add_all(["--set-section-flags", ".BTF=alloc,readonly", "--only-section=.BTF", "--strip-all"])
+    object_args.add(template_object)
+    object_args.add(btf_object)
+    path_mapped_run(
+        ctx.actions,
+        executable = _llvm_objcopy(cc_toolchain),
+        inputs = [template_object, resolved_btf],
+        outputs = [btf_object],
+        arguments = [object_args],
+        mnemonic = "LinuxBTFObject",
+        progress_message = "Creating Linux vmlinux BTF object %{label}",
+    )
+    return btf_object, resolved_ids
+
+def _linux_resolve_btfids(ctx, config, input, resolved_ids):
     if config.config_flags.get("CONFIG_DEBUG_INFO_BTF") != "y":
         return input
     if not ctx.executable.resolve_btfids_tool:
@@ -8043,13 +8107,15 @@ def _linux_resolve_btfids(ctx, config, input):
     args.add("-output", out)
     args.add("--")
     args.add(ctx.executable.resolve_btfids_tool)
-    if config.config_flags.get("CONFIG_WERROR") == "y":
+    if resolved_ids:
+        args.add("--patch_btfids", resolved_ids)
+    elif config.config_flags.get("CONFIG_WERROR") == "y":
         args.add("--fatal_warnings")
     args.add("{output}")
     path_mapped_run(
         ctx.actions,
         executable = ctx.executable._btfmutate,
-        inputs = [input],
+        inputs = [input, resolved_ids] if resolved_ids else [input],
         tools = [ctx.attr.resolve_btfids_tool[DefaultInfo].files_to_run],
         outputs = [out],
         arguments = [args],
@@ -8537,6 +8603,7 @@ def _linux_vmlinux_impl(ctx):
         kallsyms_object = _linux_kallsyms_object(ctx, compiler, cc_toolchain, feature_configuration, config, generated_headers, source_root, empty_map, ".tmp_vmlinux0", ctx.executable.kallsyms_tool)
 
     btf_object = None
+    resolved_btf_ids = None
     if config.config_flags.get("CONFIG_DEBUG_INFO_BTF") == "y":
         btf_base = ctx.actions.declare_file(ctx.label.name + ".obj/.tmp_vmlinux.btf")
         _linux_vmlinux_link(
@@ -8554,7 +8621,10 @@ def _linux_vmlinux_impl(ctx):
             btf_base,
             False,
         )
-        btf_object = _linux_btf_object(ctx, cc_toolchain, config, btf_base)
+        if _linux_version_at_least(ctx.attr.version, 7, 3):
+            btf_object, resolved_btf_ids = _linux_btf_object_with_ids(ctx, cc_toolchain, config, btf_base, version_object)
+        else:
+            btf_object = _linux_btf_object(ctx, cc_toolchain, config, btf_base)
 
     if kallsyms_enabled:
         for i in range(1, 5):
@@ -8565,7 +8635,7 @@ def _linux_vmlinux_impl(ctx):
 
     unstripped = ctx.actions.declare_file(ctx.label.name + ".vmlinux.unstripped")
     linked = _linux_vmlinux_link(ctx, linker, cc_toolchain, feature_configuration, image_object, image_object_inputs, export_object, version_object, linker_script, kallsyms_object, btf_object, unstripped, False)
-    linked = _linux_resolve_btfids(ctx, config, linked)
+    linked = _linux_resolve_btfids(ctx, config, linked, resolved_btf_ids)
     unstripped = _linux_sorttable(ctx, cc_toolchain, config, linked)
     out = ctx.actions.declare_file(ctx.label.name + ".vmlinux")
     out = _linux_strip_vmlinux(ctx, cc_toolchain, config, unstripped, out)
